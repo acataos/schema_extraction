@@ -71,12 +71,12 @@ def apply_heuristic(text: str, heuristic: dict) -> str | None:
             return None
     return None
 
-def chunk_text(text: str) -> list[str]:
+def chunk_text(text: str, chunk_size=100, chunk_overlap=50) -> list[str]:
     """Divide o texto em chunks lógicos usando uma estratégia robusta."""
     # Esta é a estratégia "RecursiveCharacterTextSplitter" que discutimos
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=50,      # Tamanho do chunk em caracteres.
-        chunk_overlap=20,   # Sobreposição para não quebrar o contexto.
+        chunk_size=chunk_size,      # Tamanho do chunk em caracteres.
+        chunk_overlap=chunk_overlap,   # Sobreposição para não quebrar o contexto.
         separators=["\n\n", "\n", ". ", " ", ""] # Ordem de prioridade
     )
     return text_splitter.split_text(text)
@@ -93,14 +93,14 @@ def find_top_k_chunks(query: str, text_chunks: list[str], chunk_embeddings: torc
     
     # Merge top k chunks into a single context string
     relevant_context = [text_chunks[idx] for idx in top_results[1]]
-    return "\n---\n".join(relevant_context)
+    return "\n---\n".join(relevant_context), cos_scores[top_results[1]].tolist()
 
 def call_llm_extractor(context: str, key: str, description: str) -> dict:
     """Chama o LLM (gpt-5 mini) para extrair o valor E a heurística RegEx."""
     
     if not client:
         print("ERRO: Cliente OpenAI não inicializado.")
-        return {"value": None, "heuristic_regex": None}
+        return {"value": None, "regex": None}
 
     system_prompt = """
     Você é um assistente de extração de dados em português.
@@ -111,15 +111,13 @@ def call_llm_extractor(context: str, key: str, description: str) -> dict:
     2. Crie um padrão RegEx (Python) robusto para capturar este valor. Foque nas palavras-chave ao redor do valor.
     3. O RegEx deve ter **apenas um grupo de captura** `(...)` contendo o valor.
     4. Se o valor não for encontrado, retorne `null` para ambos os campos.
-    5. Responda APENAS com um objeto JSON. Não inclua "```json" ou qualquer explicação.
+    5. Responda APENAS com um objeto JSON com as chaves `value` e `regex`. Não inclua "```json" ou qualquer explicação.
     """
     
     human_prompt = f"""
     ---
     CONTEXTO (Apenas trechos relevantes do documento):
-    """
     {context}
-    """
     ---
     CAMPO PARA EXTRAIR:
     Chave: "{key}"
@@ -135,24 +133,24 @@ def call_llm_extractor(context: str, key: str, description: str) -> dict:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": human_prompt}
             ],
-            temperature=0.0,
             response_format={"type": "json_object"} # Força saída JSON
         )
         response_text = response.choices[0].message.content
+        breakpoint()
     except Exception as e:
         print(f"ERRO: Chamada à API OpenAI falhou para a chave '{key}'. Erro: {e}")
-        return {"value": None, "heuristic_regex": None}
+        return {"value": None, "regex": None}
 
     # Process JSON response
     try:
         data = json.loads(response_text)
         return {
             "value": data.get("value"),
-            "heuristic_regex": data.get("heuristic_regex")
+            "regex": data.get("regex")
         }
     except json.JSONDecodeError:
         print(f"ERRO: LLM retornou um JSON inválido para a chave '{key}': {response_text}")
-        return {"value": None, "heuristic_regex": None}
+        return {"value": None, "regex": None}
 
 
 # --- 4. MAIN ORCHESTRATOR ---
@@ -194,14 +192,21 @@ def extract_data(label: str, extraction_schema: dict, pdf_text: str) -> dict:
         # Prepare embeddings for document chunks
         print("  Criando chunks e embeddings do documento...")
         text_chunks = chunk_text(pdf_text)
-        chunk_embeddings = EMBEDDING_MODEL.encode(text_chunks, convert_to_tensor=True, show_progress_bar=False)
+        first_chunk = text_chunks[0]
+        other_chunks = text_chunks[1:]
+        if other_chunks:
+            chunk_embeddings = EMBEDDING_MODEL.encode(other_chunks, convert_to_tensor=True, show_progress_bar=False)
         
         for key in keys_for_llm:
             description = extraction_schema[key]
             
             # 1. Retrieve (Local)
             query = f"{key}: {description}"
-            context = find_top_k_chunks(query, text_chunks, chunk_embeddings, k=3)
+            context = [first_chunk]  # Sempre inclua o primeiro chunk
+            if other_chunks:
+                context.append(find_top_k_chunks(query, other_chunks, chunk_embeddings, k=2))
+                context = "\n---\n".join(context)
+  
             breakpoint()
             
             # 2. Extract (API Call)
@@ -209,7 +214,7 @@ def extract_data(label: str, extraction_schema: dict, pdf_text: str) -> dict:
             llm_response = call_llm_extractor(context, key, description)
             
             value = llm_response.get("value")
-            regex = llm_response.get("heuristic_regex")
+            regex = llm_response.get("regex")
             
             final_results[key] = value # Salva o valor (mesmo que seja None)
             
@@ -242,7 +247,7 @@ if __name__ == "__main__":
     with open(args.json_file, 'r', encoding='utf-8') as f:
         json_data = json.load(f)
     
-    for item in json_data:
+    for item in json_data[:1]:
         pdf_file = "./data/files/" + item['pdf_path']
         reader = pypdf.PdfReader(pdf_file)
         # assume pdf only has one page
