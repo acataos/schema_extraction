@@ -113,7 +113,6 @@ class Extractor:
             retrieved_snippets_by_key = {}
             for key in keys_for_llm:
                 description = extraction_schema[key]
-                context_snippets = [doc.first_chunk] # Heurística Posicional
                 
                 # Keyword Retrieval
                 kw_lines, score = doc.get_keyword_line_numbers(key)
@@ -121,10 +120,8 @@ class Extractor:
                 # Semantic Retrieval (roda sempre)
                 query = f"{key}: {description}"
                 sem_chunk_indices = doc.get_semantic_chunk_indices(query, kw_lines)
-                context_snippets.update([doc.semantic_chunks[i] for i in sem_chunk_indices])
                 
-                retrieved_snippets_by_key[key] = context_snippets
-            breakpoint()
+                retrieved_snippets_by_key[key] = set(doc.semantic_chunks[i] for i in sem_chunk_indices)
 
             # 2c. Grouping Pass (Lógica de Grafo/Interseção)
             print("  Agrupando chaves por sobreposição de snippets...")
@@ -148,11 +145,11 @@ class Extractor:
                     merged_groups.append(current_group)
             
             print(f"  -> Grupos de extração formados: {[list(g) for g in merged_groups]}")
-            breakpoint()
 
             # 2d. Extract Pass
             for key_group_set in merged_groups:
                 all_snippets = set().union(*(retrieved_snippets_by_key[key] for key in key_group_set))
+                all_snippets.update({doc.first_chunk})
                 context = "\n---\n".join(sorted(all_snippets))
                 schema_group = {key: extraction_schema[key] for key in key_group_set}
                 
@@ -167,7 +164,6 @@ class Extractor:
                     print(f"  [APRENDIZADO EM GRUPO] LLM gerou nova heurística para {list(key_group_set)}")
                     for key in key_group_set:
                         new_heuristics_learned[key] = heuristic
-                breakpoint()
 
         # --- PASSO 3: Salvar Conhecimento (no cache em memória) ---
         if new_heuristics_learned:
