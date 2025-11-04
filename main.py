@@ -1,7 +1,14 @@
 import argparse
-import pypdf
 import json
+import time
+import fitz # Importa PyMuPDF
 from extractor import Extractor
+
+def get_fitz_dict_from_pdf(pdf_path: str) -> dict:
+    """Carrega um PDF e extrai o 'dict' da primeira página."""
+    with fitz.open(pdf_path) as doc:
+        page = doc[0] # Pega a primeira página
+        return page.get_text("dict")
 
 def run_extraction(json_data):
     extractor = Extractor()
@@ -9,14 +16,12 @@ def run_extraction(json_data):
     results = []
     for item in json_data[:1]:
         pdf_file = "./data/files/" + item['pdf_path']
-        reader = pypdf.PdfReader(pdf_file)
-        # assume pdf only has one page
-        pdf_text = reader.pages[0].extract_text()
+        fitz_dict = get_fitz_dict_from_pdf(pdf_file)
         
         results.append(extractor.extract(
             item["label"],
             item["extraction_schema"],
-            pdf_text
+            fitz_dict
         ))
 
 if __name__ == "__main__":
@@ -30,7 +35,4 @@ if __name__ == "__main__":
         json_data = json.load(f)
 
     results = run_extraction(json_data)
-
-
-
 

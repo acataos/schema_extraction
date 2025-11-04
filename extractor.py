@@ -1,181 +1,264 @@
-import re
 import time
+import concurrent.futures
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 from typing import Dict, Any
 
 import config
-from text_utils import normalize_text
 from document import Document
-from llm_service import call_llm_extractor
+from llm_service import find_values_from_layout
+from text_utils import stopword_filter, calculate_stopwords
+
+JACCARD_THRESHOLD = 0.95
+FULL_SCHEMAS = dict() # armazena schemas completos para análises futuras
+
+# Carregamos os modelos globalmente
+try:
+    EMBEDDING_MODEL = SentenceTransformer(
+        config.EMBEDDING_MODEL_NAME, 
+        device=config.DEVICE
+    )
+    print(f"Modelo de embedding carregado em: {config.DEVICE}")
+except Exception as e:
+    print(f"ERRO CRÍTICO: Não foi possível carregar o SentenceTransformer: {e}")
+    EMBEDDING_MODEL = None
 
 class Extractor:
     def __init__(self):
-        """
-        Inicializa o Extractor, carregando os modelos e o cache em memória.
-        """
-        print("Carregando modelos (isso acontece uma vez)...")
-        self.cache: Dict[str, Dict[str, Any]] = {}
+        print("Inicializando Extractor...")
         
         try:
-            self.client = OpenAI() # Lê OPENAI_API_KEY do ambiente
+            self.client = OpenAI()
         except Exception as e:
             print(f"ERRO: Não foi possível inicializar o cliente OpenAI: {e}")
             self.client = None
             
-        self.embedding_model = SentenceTransformer(
-            config.EMBEDDING_MODEL_NAME, 
-            device=config.DEVICE
-        )
-        print(f"Modelos carregados. Usando device: {config.DEVICE}")
+        self.embedding_model = EMBEDDING_MODEL
+        if not self.embedding_model:
+            print("AVISO: Extractor inicializado sem modelo de embedding.")
 
-    def _apply_heuristic(self, text: str, heuristic: dict, key: str) -> str | None:
-        """
-        Tenta aplicar uma heurística (simples ou grupo) ao texto completo.
-        """
-        heuristic_type = heuristic.get("type")
-        pattern = heuristic.get("pattern")
-        if not pattern:
-            return None
+        print("Extrator pronto.")
 
-        normalized_text = normalize_text(text)
+    def _calculate_jaccard(self, set1: frozenset[str], set2: frozenset[str]) -> float:
+        """Calcula a Similaridade Jaccard entre dois conjuntos de snippets."""
+        intersection = len(set1.intersection(set2))
+        union = len(set1.union(set2))
         
-        try:
-            # Lógica para heurística de chave única
-            if heuristic_type == "regex":
-                normalized_pattern = normalize_text(pattern)
-                match = re.search(normalized_pattern, normalized_text, re.DOTALL | re.IGNORECASE)
-                if match and match.group(1) is not None:
-                    start, end = match.start(1), match.end(1)
-                    return text[start:end].strip()
+        if union == 0:
+            return 1.0  # Dois conjuntos vazios são idênticos
+        
+        return intersection / union
 
-            # Lógica para heurística de grupo
-            elif heuristic_type == "regex_group":
-                mapping = heuristic.get("group_mapping", [])
-                if key not in mapping:
-                    return None # Heurística não se aplica a esta chave
-                
-                key_index = mapping.index(key)
-                capture_group_index = key_index + 1 # Grupos de RegEx são 1-based
-                
-                normalized_pattern = normalize_text(pattern)
-                match = re.search(normalized_pattern, normalized_text, re.DOTALL | re.IGNORECASE)
-                
-                if match and match.group(capture_group_index) is not None:
-                    start, end = match.start(capture_group_index), match.end(capture_group_index)
-                    return text[start:end].strip()
-                    
-        except re.error as e:
-            print(f"ERRO: RegEx inválido na KB: {pattern}. Erro: {e}")
-            
-        return None
-
-    def extract(self, label: str, extraction_schema: dict, pdf_text: str) -> dict:
+    def extract(self, label: str, extraction_schema: dict, fitz_page_dict: dict) -> dict:
         """
-        Orquestra o pipeline de extração completo.
+        Pipeline baseline: Recupera âncoras, "infla" o contexto,
+        agrupa e extrai valores.
         """
         print(f"\n--- Processando Label: {label} ---")
         start_time = time.time()
+        # Update FULL_SCHEMAS
+        FULL_SCHEMAS[label] = {**FULL_SCHEMAS.get(label, {}), **extraction_schema}
         
-        heuristics = self.cache.get(label, {})
-        final_results = {}
-        keys_for_llm = [] 
+        if not self.embedding_model:
+            print("ERRO: Modelo de embedding não carregado. Abortando.")
+            return {key: None for key in extraction_schema}
+            
+        try:
+            doc = Document(fitz_page_dict)
+            doc.embed_spans(self.embedding_model)
+            doc.find_tables()
 
-        # --- PASSO 1: HEURISTIC PASS (Rápido / Custo Zero) ---
-        print("Iniciando Passo 1: Tentativa com Heurísticas (Cache)...")
+        except ValueError as e:
+            print(e)
+            return {key: None for key in extraction_schema}
+
+        # --- PASSO 1: RECUPERAÇÃO DE "ÂNCORAS" ---
+        print("  Iniciando Passo 1: Recuperação de Âncoras...")
+        
+        # retrieved_anchors_by_key armazena os OBJETOS Line, não strings
+        retrieved_anchors_by_key: Dict[str, set[Line]] = {}
+
+        # find schema stopwords
+        descs = FULL_SCHEMAS[label].values()
+        stopwords = calculate_stopwords(list(descs), threshold=0.5)
+        
         for key, description in extraction_schema.items():
-            if key in heuristics:
-                value = self._apply_heuristic(pdf_text, heuristics[key], key)
-                if value:
-                    final_results[key] = value
-                    print(f"  [CACHE HIT] Chave '{key}' encontrada com RegEx.")
-                else:
-                    print(f"  [CACHE MISS] RegEx falhou para '{key}'. Enviando para LLM.")
-                    keys_for_llm.append(key)
+            description = stopword_filter(description, stopwords)
+            # 1a. Keyword Retrieval (retorna List[Line])
+            kw_lines = doc.get_keyword_matching_lines(key)
+            
+            # 1b. Semantic Retrieval (retorna List[Line])
+            query = f"{key}: {description}"
+            sem_lines = doc.get_semantic_matching_lines(self.embedding_model, query, k=config.SNIPPET_K_SEMANTIC-len(kw_lines))
+            
+            # 1c. Combina os objetos Line
+            context_set = set(kw_lines).union(set(sem_lines))
+            retrieved_anchors_by_key[key] = context_set
+
+        # --- PASSO 2: INFLAR O CONTEXTO E AGRUPAR ---
+        print("  Iniciando Passo 2: Inflar Contexto e Agrupar Chaves...")
+        
+        # Agora, a "assinatura" de uma chave é o seu CONTEXTO INFLADO
+        retrieved_snippets_by_key: Dict[str, frozenset[str]] = {}
+        
+        for key, anchor_lines in retrieved_anchors_by_key.items():
+            inflated_snippets = set()
+            if not anchor_lines:
+                # Se não encontrou âncoras, a assinatura está vazia
+                retrieved_snippets_by_key[key] = frozenset()
+                continue
+            
+            # "Infla" o contexto para cada âncora encontrada
+            for line in anchor_lines:
+                context_lines = doc.get_context_for_line(line, window_size=2)
+                inflated_snippets.update(context_lines)
+
+            
+            # A "assinatura" da chave é o conjunto de todos os seus
+            # snippets de contexto inflado
+            retrieved_snippets_by_key[key] = frozenset(inflated_snippets)
+
+        # --- PASSO 3: AGRUPAMENTO (BATCHING) ---
+        # (Esta lógica não muda, mas agora opera em assinaturas de contexto
+        # muito mais ricas e precisas)
+        clusters = []
+        keys_without_snippets = set()
+        for key, snippets in retrieved_snippets_by_key.items():
+            if not snippets:
+                keys_without_snippets.add(key)
+                continue
+            clusters.append({
+                'keys': {key},
+                'snippets': snippets
+            })
+
+        # 2. Loop de clustering aglomerativo
+        while True:
+            best_score = -1
+            best_pair_to_merge = None # (index_i, index_j)
+
+            # Encontra o melhor par para fundir (O(n^2), aceitável para N < 100)
+            for i in range(len(clusters)):
+                for j in range(i + 1, len(clusters)):
+                    c1 = clusters[i]
+                    c2 = clusters[j]
+                    
+                    score = self._calculate_jaccard(c1['snippets'], c2['snippets'])
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_pair_to_merge = (i, j)
+            
+            # 3. Decide se funde ou para
+            if best_pair_to_merge and best_score >= JACCARD_THRESHOLD:
+                i, j = best_pair_to_merge
+                
+                # Para evitar reindexação, pegamos os índices em ordem decrescente
+                c2 = clusters.pop(max(i, j))
+                c1 = clusters.pop(min(i, j))
+                
+                # Cria o novo cluster fundido
+                merged_cluster = {
+                    'keys': c1['keys'].union(c2['keys']),
+                    'snippets': c1['snippets'].union(c2['snippets'])
+                }
+                
+                clusters.append(merged_cluster) # Adiciona de volta à lista
+                # E continua o loop para encontrar o próximo melhor merge
             else:
-                print(f"  [CACHE MISS] Sem heurística para '{key}'. Enviando para LLM.")
-                keys_for_llm.append(key)
+                # Não há mais merges possíveis acima do limite
+                break 
 
-        # --- PASSO 2: LLM FALLBACK (Lento / Pago) ---
-        new_heuristics_learned = {}
-        if keys_for_llm:
-            print(f"\nIniciando Passo 2: Fallback para LLM (Campos: {keys_for_llm})...")
+        # 4. Coleta os grupos finais
+        final_groups: list[Set[str]] = [c['keys'] for c in clusters]
+        
+        # Adiciona as chaves que não tinham snippets como seu próprio grupo
+        if keys_without_snippets:
+            final_groups.append(keys_without_snippets)
+        
+        print(f"  -> Grupos de extração formados: {[list(g) for g in final_groups]}")
+        # groups = [{key} for key in extraction_schema.keys()]
+        # merged_groups = []
+        # while groups:
+        #     current_group = groups.pop(0)
+        #     current_snippets = set().union(*(retrieved_snippets_by_key[key] for key in current_group))
+        #     if not current_snippets: # Grupo de chaves sem contexto
+        #         merged_groups.append(current_group)
+        #         continue
+        #
+        #     merged_with_current = False
+        #     remaining_groups = []
+        #     for other_group in groups:
+        #         other_snippets = set().union(*(retrieved_snippets_by_key[key] for key in other_group))
+        #         if not other_snippets:
+        #             remaining_groups.append(other_group)
+        #             continue
+        #
+        #         if not current_snippets.isdisjoint(other_snippets):
+        #             current_group.update(other_group)
+        #             merged_with_current = True
+        #         else:
+        #             remaining_groups.append(other_group)
+        #
+        #     if merged_with_current:
+        #         groups = [current_group] + remaining_groups
+        #     else:
+        #         merged_groups.append(current_group)
+        #
+        # print(f"  -> Grupos de extração formados: {[list(g) for g in merged_groups]}")
+
+        # --- PASSO 4: EXTRAÇÃO (LLM EM PARALELO) ---
+        print("  Iniciando Passo 4: Extração via LLM (Paralelizada)...")
+        final_results = {}
+        
+        # Define um número máximo de chamadas simultâneas
+        # para evitar ser bloqueado pela API (Rate Limit)
+        MAX_CONCURRENT_CALLS = 5 
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CALLS) as executor:
+            # Dicionário para mapear "futuros" de volta para seus grupos
+            future_to_group = {}
             
-            try:
-                # 2a. Pré-processa o documento (OOP)
-                doc = Document(pdf_text, self.embedding_model)
-            except ValueError as e:
-                print(e)
-                for key in keys_for_llm: final_results[key] = None
-                return final_results
-
-            # 2b. Retrieval Pass (Híbrido)
-            retrieved_snippets_by_key = {}
-            for key in keys_for_llm:
-                description = extraction_schema[key]
-                
-                # Keyword Retrieval
-                kw_lines, score = doc.get_keyword_line_numbers(key)
-
-                # Semantic Retrieval (roda sempre)
-                query = f"{key}: {description}"
-                sem_chunk_indices = doc.get_semantic_chunk_indices(query, kw_lines)
-                
-                retrieved_snippets_by_key[key] = set(doc.semantic_chunks[i] for i in sem_chunk_indices)
-
-            # 2c. Grouping Pass (Lógica de Grafo/Interseção)
-            print("  Agrupando chaves por sobreposição de snippets...")
-            groups = [{key} for key in keys_for_llm]
-            merged_groups = []
-            while groups:
-                current_group = groups.pop(0)
-                current_snippets = set().union(*(retrieved_snippets_by_key[key] for key in current_group))
-                merged_with_current = False
-                remaining_groups = []
-                for other_group in groups:
-                    other_snippets = set().union(*(retrieved_snippets_by_key[key] for key in other_group))
-                    if not current_snippets.isdisjoint(other_snippets):
-                        current_group.update(other_group)
-                        merged_with_current = True
-                    else:
-                        remaining_groups.append(other_group)
-                if merged_with_current:
-                    groups = [current_group] + remaining_groups
-                else:
-                    merged_groups.append(current_group)
-            
-            print(f"  -> Grupos de extração formados: {[list(g) for g in merged_groups]}")
-
-            # 2d. Extract Pass
-            for key_group_set in merged_groups:
+            for key_group_set in final_groups:
                 all_snippets = set().union(*(retrieved_snippets_by_key[key] for key in key_group_set))
-                all_snippets.update({doc.first_chunk})
-                context = "\n---\n".join(sorted(all_snippets))
+                
+                if not all_snippets:
+                    print(f"  GRUPO {list(key_group_set)} não teve snippets. Retornando None.")
+                    for key in key_group_set:
+                        final_results[key] = None
+                    continue
+
+                lines_sorted = sorted([doc.lines[i] for i in all_snippets])
+                context = "\n---\n".join([line.serialize_layout() for line in lines_sorted])
                 schema_group = {key: extraction_schema[key] for key in key_group_set}
                 
-                print(f"  Chamando LLM para o GRUPO: {list(key_group_set)}...")
-                llm_response = call_llm_extractor(self.client, context, schema_group)
+                print(f"  Submetendo chamada para o GRUPO: {list(key_group_set)}...")
                 
-                if llm_response.get("values"):
-                    final_results.update(llm_response["values"])
-                
-                if llm_response.get("heuristic"):
-                    heuristic = llm_response["heuristic"]
-                    print(f"  [APRENDIZADO EM GRUPO] LLM gerou nova heurística para {list(key_group_set)}")
-                    for key in key_group_set:
-                        new_heuristics_learned[key] = heuristic
+                # Submete a tarefa para a pool de threads
+                future = executor.submit(
+                    find_values_from_layout,
+                    self.client, 
+                    context, 
+                    schema_group
+                )
+                future_to_group[future] = key_group_set
 
-        # --- PASSO 3: Salvar Conhecimento (no cache em memória) ---
-        if new_heuristics_learned:
-            print("\nSalvando novas heurísticas aprendidas no cache da sessão...")
-            if label not in self.cache:
-                self.cache[label] = {}
-            self.cache[label].update(new_heuristics_learned)
-            
+            # Coleta os resultados à medida que ficam prontos
+            for future in concurrent.futures.as_completed(future_to_group):
+                key_group_set = future_to_group[future]
+                try:
+                    # Pega o resultado da thread
+                    llm_values = future.result()
+                    final_results.update(llm_values)
+                    print(f"  -> Resultado recebido para o GRUPO: {list(key_group_set)}")
+                except Exception as e:
+                    print(f"ERRO: A thread para o grupo {list(key_group_set)} falhou: {e}")
+                    for key in key_group_set:
+                        final_results[key] = None # Garante 'None' em caso de falha
+
         end_time = time.time()
         print(f"--- Processamento Concluído em {end_time - start_time:.2f} segundos ---")
         
-        # Garante que todas as chaves solicitadas tenham pelo menos um 'None'
         for key in extraction_schema:
             if key not in final_results:
                 final_results[key] = None
