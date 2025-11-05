@@ -9,6 +9,7 @@ EMBEDDING_MODEL_NAME = 'paraphrase-multilingual-MiniLM-L12-v2'
 # Quão perto (em pixels) duas caixas de texto precisam estar para
 # serem consideradas "próximas"
 PROXIMITY_THRESHOLD = 10
+SEMANTIC_MATCH_THRESHOLD = 0.6
 # Quantos pixels duas linhas podem variar em 'y' e ainda serem
 # consideradas parte da mesma linha
 ROW_TOLERANCE = 5
