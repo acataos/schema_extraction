@@ -383,27 +383,28 @@ class Document:
                 continue
             below_boxes = [self.find_close_box(box, "below") for box in boxes]
             line_indices = [below_box.line_idx if below_box is not None else -1 for below_box in below_boxes]
-            most_common_line = max(set(line_indices), key=line_indices.count)
-            if line_indices.count(most_common_line)/len(line_indices) < 0.5 or line_indices.count(-1)/len(line_indices) > 0.5:
+            first_line_below = min([id for id in line_indices if id != -1], default=-1)
+            if line_indices.count(first_line_below)<2 or first_line_below==-1:
                 continue
-            line_size_ratio = len(self.lines[most_common_line])/len(line)
-            if line_size_ratio < 0.7 or line_size_ratio > 1.5:
-                continue 
             if line.table_id is None:
                 object.__setattr__(line, 'table_id', len(self.tables_dict))
-                object.__setattr__(self.lines[most_common_line], 'table_id', len(self.tables_dict))
-                self.tables_dict[len(self.tables_dict)] = [line.idx, most_common_line]
+                object.__setattr__(self.lines[first_line_below], 'table_id', len(self.tables_dict))
+                self.tables_dict[len(self.tables_dict)] = [line.idx, first_line_below]
             else: 
-                object.__setattr__(self.lines[most_common_line], 'table_id', line.table_id)
-                self.tables_dict[line.table_id].append(most_common_line)
-            col_index = 0
+                object.__setattr__(self.lines[first_line_below], 'table_id', line.table_id)
+                self.tables_dict[line.table_id].append(first_line_below)
+            col_index = max([box.col_index for box in boxes if box.col_index is not None], default=-1) + 1
             for box in boxes:
                 below_box = self.find_close_box(box, "below")
-                if below_box is not None and below_box in self.lines[most_common_line].boxes:
-                    col_index = box.col_index if box.col_index is not None else col_index
-                    object.__setattr__(box, 'col_index', col_index)
-                    object.__setattr__(below_box, 'col_index', col_index)
-                    col_index += 1
+                if below_box is not None and below_box in self.lines[first_line_below].boxes:
+                    if box.col_index is not None:
+                        object.__setattr__(box, 'col_index', box.col_index)
+                        object.__setattr__(below_box, 'col_index', box.col_index)
+                    else:
+                        object.__setattr__(below_box, 'col_index', col_index)
+                        object.__setattr__(box, 'col_index', col_index)
+                        col_index += 1
+
 
     def embed_spans(self, embedding_model: SentenceTransformer):
         """
@@ -658,37 +659,59 @@ class Document:
         
         return matched_lines
 
+
     def search_for_categories(self, categories: List[str]) -> Set[str]:
         """
-        Busca o documento inteiro por uma lista de valores de categoria exatos.
-        Este é o "motor" do fast-path.
+        Busca o documento por uma lista de categorias.
+        
+        Esta versão é ROBUSTA A ACENTOS/CASE/ESPAÇOS e retorna
+        o TEXTO ORIGINAL encontrado no documento, conforme sua sugestão.
         
         Args:
-            categories: Uma lista de strings de categoria (ex: ["vencido", "pago"]).
+            categories: Uma lista de strings de categoria (ex: ["vencido", "pago", "Nome Fantasia"]).
             
         Returns:
-            Um conjunto (set) dos valores de categoria (originais, não normalizados) 
-            que foram encontrados no texto.
+            Um conjunto (set) dos valores de categoria *como eles foram
+            encontrados no texto* (ex: {"Vencido", "NOME FANTASIA"}).
         """
-        # Normaliza as categorias para busca (ex: "ADVOGADO" -> "advogado")
-        norm_categories = {normalize_text(cat): cat for cat in categories}
-        found_categories = set()
         
-        # Itera sobre todas as linhas do documento
+        found_original_values = set()
+        
+        # 1. Normaliza as categorias do schema para a busca
+        # (ex: ["vencido", "pago", "nome fantasia"])
+        norm_categories = [normalize_text(cat) for cat in categories]
+        
+        # 2. Itera sobre todas as linhas do documento
         for line in self.lines:
-            norm_line_text = normalize_text(line.text)
             
-            # Verifica se alguma das nossas categorias está nesta linha
-            for norm_cat, original_cat in norm_categories.items():
+            # 3. Pega os dois textos: original e normalizado
+            original_line_text = line.text 
+            # (ex: "Cliente: NOME FANTASIA | Tipo: Advogado")
+            norm_line_text = normalize_text(original_line_text)
+            # (ex: "cliente: nome fantasia | tipo: advogado")
+
+            # 4. Itera sobre as categorias normalizadas
+            for norm_cat in norm_categories:
+                if not norm_cat: # Pula categorias vazias
+                    continue
                 
-                # Usa RegEx com \b (word boundary) para garantir que
-                # "pago" não corresponda a "pagamento".
+                # 5. Cria o padrão de busca com \b (word boundary)
+                #    Isso é crucial para "pago" vs "pagamento"
                 pattern = r'\b' + re.escape(norm_cat) + r'\b'
                 
-                if re.search(pattern, norm_line_text):
-                    found_categories.add(original_cat) # Adiciona o valor ORIGINAL
+                # 6. Busca no texto NORMALIZADO
+                #    Usamos re.finditer para pegar todas as ocorrências
+                for match in re.finditer(pattern, norm_line_text, re.IGNORECASE):
+                    # 7. Pegar os índices do match
+                    start_index = match.start()
+                    end_index = match.end()
+                    
+                    # 8. SUCESSO! Usar os índices para fatiar o texto ORIGINAL
+                    original_value = original_line_text[start_index:end_index]
+                    
+                    found_original_values.add(original_value)
         
-        return found_categories
+        return found_original_values
 
     def get_categorical_snippets(self, categories: List[str]) -> set[Line]:
         """
