@@ -474,9 +474,25 @@ class Document:
         scored_boxes = []
         for box in self.boxes:
             box_text = normalize_text(box.text)
-            score = fuzz.ratio(normalized_key, box_text)
-            if score >= 80:
-                scored_boxes.append((box, score))
+            key_candidates = []
+            segments = box_text.split(":")
+            max_score = 0
+            for i,segment in enumerate(segments):
+                # First segment should be the label, last the value
+                # Segments in between should be half label, half value
+                if i==0:
+                    key_candidates = [segment]
+                elif i==len(segments)-1:
+                    break
+                else:
+                    subsegments = segment.split(" ")
+                    for i in range(1, len(subsegments)):
+                        key_candidate = " ".join(subsegments[i:])
+                        key_candidates.append(key_candidate)
+                max_score = max(max_score, max(fuzz.ratio(normalized_key, kc) for kc in key_candidates))
+                
+            if max_score >= 80:
+                scored_boxes.append((box, max_score))
         if not scored_boxes:
             return snippets
         
