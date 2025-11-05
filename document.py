@@ -22,6 +22,14 @@ class Line:
     def text(self) -> str:
         return " ".join([b.text for b in self.boxes])
 
+    @property
+    def y0(self) -> float:
+        return min(b.y0 for b in self.boxes)
+
+    @property
+    def y1(self) -> float:
+        return max(b.y1 for b in self.boxes)
+
     def __len__(self):
         return len(self.boxes)
 
@@ -33,8 +41,6 @@ class Line:
                 s += f"{{col: {b.col_index}}} "
             if i < len(self.boxes)-1:
                 s+= "| "
-            else:
-                s+= "\n"
 
         return s
 
@@ -141,7 +147,8 @@ class Document:
         self.full_text = " ".join([b.text for b in self.boxes])
         
         # Propriedades de layout calculadas uma vez
-        self.page_bbox = fitz_page_dict.get("rect", None) # Default A4
+        self.page_height = fitz_page_dict.get("height", None)
+        self.page_width = fitz_page_dict.get("width", None)
         self.max_font_size = max(b.font_size for b in self.boxes)
         self.min_font_size = min(b.font_size for b in self.boxes)
         self.tables_dict = {}  # Mapeia table_id para listas de índices de linhas
@@ -174,16 +181,17 @@ class Document:
         """
         if not boxes:
             return []
+        sorted_boxes = sorted(boxes, key=lambda b: (b.shrinked_y0, b.shrinked_x0))
 
         lines: List[Line] = []
-        current_line_boxes: List[TextBox] = [boxes[0]]
+        current_line_boxes: List[TextBox] = [sorted_boxes[0]]
         
         # Define o BBox vertical da linha atual
-        current_line_y0 = boxes[0].shrinked_y0
-        current_line_y1 = boxes[0].shrinked_y1
-        object.__setattr__(boxes[0], "line_idx", 0)  # Define o índice da linha"
+        current_line_y0 = sorted_boxes[0].shrinked_y0
+        current_line_y1 = sorted_boxes[0].shrinked_y1
+        object.__setattr__(sorted_boxes[0], "line_idx", 0)  # Define o índice da linha"
 
-        for box in boxes[1:]:
+        for box in sorted_boxes[1:]:
             # Testa a interseção vertical usando sua lógica:
             # (max(y0_a, y0_b) < min(y1_a, y1_b))
             does_intersect = max(current_line_y0, box.shrinked_y0) < min(current_line_y1, box.shrinked_y1)
@@ -375,7 +383,7 @@ class Document:
             below_boxes = [self.find_close_box(box, "below") for box in boxes]
             line_indices = [below_box.line_idx if below_box is not None else -1 for below_box in below_boxes]
             most_common_line = max(set(line_indices), key=line_indices.count)
-            if line_indices.count(most_common_line)/len(line_indices) < 0.6 or line_indices.count(-1)/len(line_indices) > 0.3:
+            if line_indices.count(most_common_line)/len(line_indices) < 0.5 or line_indices.count(-1)/len(line_indices) > 0.5:
                 continue
             line_size_ratio = len(self.lines[most_common_line])/len(line)
             if line_size_ratio < 0.7 or line_size_ratio > 1.5:
@@ -405,8 +413,6 @@ class Document:
             self.span_embeddings = None
             print("AVISO: Documento não contém spans (TextBoxes) para embedar.")
             return
-
-        print(f"  Calculando embeddings para {len(self.boxes)} spans (text boxes)...")
         
         # Pega o texto de cada span individual
         span_texts = [box.text for box in self.boxes]
@@ -443,13 +449,15 @@ class Document:
         # Agora, mapeia os spans de volta para suas linhas pai
         matched_lines = set()
         for idx in top_results[1]:
+            if cos_scores[idx] < config.SEMANTIC_MATCH_THRESHOLD:
+                continue
             matched_span = self.boxes[idx]
             
             # Usa nosso mapa para encontrar a linha pai
             parent_line = self.lines[matched_span.line_idx]
-            if parent_line:
+            if parent_line is not None:
                 matched_lines.add(parent_line)
-                
+
         return matched_lines
 
     def get_keyword_matching_lines(self, key: str) -> (set[str], int):
@@ -478,34 +486,157 @@ class Document:
                 
         return top_lines
 
-    def get_context_for_line(self, line: Line, window_size: int = 2) -> str:
+    def get_context_for_line(self, line: Line) -> Set[int]:
         """
-        "Infla" uma única linha para seu bloco de contexto lógico.
+        "Infla" uma única linha âncora para seu bloco de contexto lógico,
+        parando em grandes lacunas verticais ou fronteiras de tabela.
+        
+        Retorna: Um conjunto (Set) de strings, onde cada string é o texto
+                 de uma linha no bloco de contexto.
         """
         
         # LÓGICA 1: Se a linha está em uma tabela, retorne a tabela inteira.
         if line.table_id is not None:
             try:
                 # Encontra o objeto Table e serializa ele
-                lines = next(lines for (id,lines) in self.tables_dict.items() if id == line.table_id)
-                return set(lines)
-            except (StopIteration, AttributeError):
-                pass # Falha: apenas continue para a lógica de janela
+                table_lines = self.tables_dict.get(line.table_id, [])
+                # Retorna o texto de todas as linhas da tabela
+                return {l for l in table_lines}
+            except Exception as e:
+                print(f"AVISO: Falha ao buscar tabela para linha {line.idx}. {e}")
+                # Falha: continue para a lógica de janela,
+                # mas trate como uma linha normal (table_id = None).
+                pass
         
-        # LÓGICA 2: Se não for uma tabela, pegue uma "janela" de linhas vizinhas.
-            
+        # --- LÓGICA 2 e 3: ADAPTATIVAS (Sua nova proposta) ---
+        
+        # Constante para a heurística de espaçamento
+        # (Um gap > 150% da altura da linha é uma quebra de bloco)
+        GAP_MULTIPLIER = 1.5
+        
+        context_lines_set = {line} # Começa com a própria âncora
         current_index = line.idx
-        start_index = max(0, current_index - window_size)
-        end_index = min(len(self.lines), current_index + window_size + 1)
         
-        context_lines = []
-        for i in range(start_index, end_index):
+        # --- 1. Crescer para BAIXO ---
+        # Itera pelas linhas abaixo da âncora
+        for i in range(current_index + 1, len(self.lines)):
+            prev_line = self.lines[i - 1]
             neighbor_line = self.lines[i]
             
-            # LÓGICA 3: (Sua 2ª ideia) Não poluir com linhas de *outras* tabelas
-            if neighbor_line.table_id is not None and neighbor_line.table_id != line.table_id:
-                continue # Pula esta linha pois pertence a uma tabela irrelevante
+            # LÓGICA 3: Parar se entrarmos em uma tabela
+            if neighbor_line.table_id is not None:
+                break
             
-            context_lines.append(i)
+            # LÓGICA 2: Heurística de Espaçamento
+            gap = neighbor_line.y0 - prev_line.y1
+            line_height = prev_line.y1 - prev_line.y0
+            if line_height <= 0: line_height = 1 # Evita divisão por zero
             
-        return set(context_lines)
+            if gap > (line_height * GAP_MULTIPLIER):
+                break # Encontrou uma grande lacuna; fim do bloco
+            
+            # Se passou: a linha é conectada
+            context_lines_set.add(neighbor_line)
+
+        # --- 2. Crescer para CIMA ---
+        # Itera pelas linhas acima da âncora (em ordem reversa)
+        for i in range(current_index - 1, -1, -1):
+            next_line = self.lines[i + 1]
+            neighbor_line = self.lines[i]
+            
+            # LÓGICA 3: Parar se entrarmos em uma tabela
+            if neighbor_line.table_id is not None:
+                break
+                
+            # LÓGICA 2: Heurística de Espaçamento
+            gap = next_line.y0 - neighbor_line.y1
+            line_height = neighbor_line.y1 - neighbor_line.y0
+            if line_height <= 0: line_height = 1
+            
+            if gap > (line_height * GAP_MULTIPLIER):
+                break # Encontrou uma grande lacuna; fim do bloco
+            
+            # Se passou: a linha é conectada
+            context_lines_set.add(neighbor_line)
+            
+        # Retorna o texto de todas as linhas do bloco
+        return {l.idx for l in context_lines_set}
+
+    def _find_boxes_in_area(self, area: str) -> List[TextBox]:
+        """
+        Helper privado para encontrar todas as caixas (spans) em uma
+        área geométrica da página (ex: 'top_left_quadrant').
+        """
+        # Define os limites das áreas. 0.4 (40%) é um bom
+        # limiar para "canto" sem ser muito restritivo.
+        x_left_limit = self.page_width * 0.25
+        x_right_limit = self.page_width * 0.75
+        y_top_limit = self.page_height * 0.25
+        y_bottom_limit = self.page_height * 0.75
+
+        found_boxes = []
+        if area == 'top_left':
+            found_boxes = [
+                b for b in self.boxes 
+                if b.center_x < x_left_limit and b.center_y < y_top_limit
+            ]
+        elif area == 'top_right':
+            found_boxes = [
+                b for b in self.boxes 
+                if b.center_x > x_right_limit and b.center_y < y_top_limit
+            ]
+        elif area == 'bottom_left':
+            found_boxes = [
+                b for b in self.boxes 
+                if b.center_x < x_left_limit and b.center_y > y_bottom_limit
+            ]
+        elif area == 'bottom_right':
+            found_boxes = [
+                b for b in self.boxes 
+                if b.center_x > x_right_limit and b.center_y > y_bottom_limit
+            ]
+        elif area == 'top':
+             found_boxes = [b for b in self.boxes if b.center_y < y_top_limit]
+        elif area == 'bottom':
+             found_boxes = [b for b in self.boxes if b.center_y > y_bottom_limit]
+        
+        # Ordena as caixas encontradas pela ordem de leitura
+        return sorted(found_boxes)
+
+    def get_positional_matching_lines(self, description: str) -> set[str]:
+        """
+        Analisa a descrição em busca de palavras-chave posicionais
+        (ex: "canto superior esquerdo") e retorna as linhas
+        encontradas nessas áreas.
+        """
+        norm_desc = normalize_text(description)
+        target_area = None
+        
+        # Mapeia palavras-chave da descrição para nossas áreas
+        if "canto superior esquerdo" in norm_desc:
+            target_area = 'top_left'
+        elif "canto superior direito" in norm_desc:
+            target_area = 'top_right'
+        elif "canto inferior esquerdo" in norm_desc:
+            target_area = 'bottom_left'
+        elif "canto inferior direito" in norm_desc:
+            target_area = 'bottom_right'
+        elif "parte superior" in norm_desc or "no topo" in norm_desc:
+            target_area = 'top'
+        elif "parte inferior" in norm_desc or "rodape" in norm_desc:
+            target_area = 'bottom'
+            
+        if not target_area:
+            return set() # Nenhuma instrução posicional encontrada
+
+        # Encontra as caixas (spans) nessa área
+        matched_boxes = self._find_boxes_in_area(target_area)
+        
+        # Converte as caixas em seus textos de Linha pai
+        matched_lines = set()
+        for box in matched_boxes:
+            parent_line_id = box.line_idx
+            if parent_line_id is not None:
+                matched_lines.add(self.lines[parent_line_id])
+        
+        return matched_lines
