@@ -174,7 +174,6 @@ class Extractor:
                 if key not in final_results: final_results[key] = None
             return final_results
 
-        print(f"  -> Fast Path concluído em {end_time_fast - start_time_fast:.2f} segundos.")
 
         # --- PASSO 3: RECUPERAÇÃO (RETRIEVAL) - Apenas para chaves do LLM ---
         print(f"  Iniciando Passo 3: Recuperação de Âncoras (para {len(keys_for_llm)} chaves)...")
