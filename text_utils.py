@@ -4,7 +4,56 @@ from thefuzz import fuzz
 
 noise_chars = [",",".",":","'",'"']
 
-def normalize_text(s: str, noise_chars = []) -> str:
+CHAR_MAP = {
+    "á": "a",
+    "à": "a",
+    "â": "a",
+    "ã": "a",
+    "ä": "a",
+    "é": "e",
+    "è": "e",
+    "ê": "e",
+    "ë": "e",
+    "í": "i",
+    "ì": "i",
+    "î": "i",
+    "ï": "i",
+    "ó": "o",
+    "ò": "o",
+    "ô": "o",
+    "õ": "o",
+    "ö": "o",
+    "ú": "u",
+    "ù": "u",
+    "û": "u",
+    "ü": "u",
+    "ç": "c",
+    "Á": "A",
+    "À": "A",
+    "Â": "A",
+    "Ã": "A",
+    "Ä": "A",
+    "É": "E",
+    "È": "E",
+    "Ê": "E",
+    "Ë": "E",
+    "Í": "I",
+    "Ì": "I",
+    "Î": "I",
+    "Ï": "I",
+    "Ó": "O",
+    "Ò": "O",
+    "Ô": "O",
+    "Õ": "O",
+    "Ö": "O",
+    "Ú": "U",
+    "Ù": "U",
+    "Û": "U",
+    "Ü": "U",
+    "Ç": "C"
+}
+
+def normalize_text(s: str, noise_chars = None) -> str:
     """
     Removes diacritics using Unicode normalization and converts to lowercase.
     Ex: "Canção" -> "cancao"
@@ -12,15 +61,13 @@ def normalize_text(s: str, noise_chars = []) -> str:
     if not s:
         return ""
     
-    # 1. Decompose characters (e.g., 'ç' -> 'c' + '¸')
-    s_nfd = unicodedata.normalize('NFD', s)
-    
-    # 2. Filter out the diacritic marks (category 'Mn' = Mark, Nonspacing)
-    s_no_diacritics = "".join(c for c in s_nfd if unicodedata.category(c) != 'Mn')
-    s_no_diacritics = "".join(c for c in s_no_diacritics if c not in noise_chars)
+
+    s = ''.join(CHAR_MAP.get(c, c) for c in s)
+    if noise_chars is not None and isinstance(noise_chars, list):
+        s = "".join(c for c in s if c not in noise_chars)
     
     # 3. Return lowercase
-    return s_no_diacritics.lower()
+    return s.lower()
 
 
 def fuzzy_match(query: str, text: str) -> int:
