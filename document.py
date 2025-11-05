@@ -7,6 +7,7 @@ from sentence_transformers import SentenceTransformer, util
 from thefuzz import fuzz
 import torch
 from text_utils import fuzzy_match, normalize_text
+import re
 
 @dataclass(frozen=True, order=True)
 class Line:
@@ -656,3 +657,61 @@ class Document:
                 matched_lines.add(self.lines[parent_line_id])
         
         return matched_lines
+
+    def search_for_categories(self, categories: List[str]) -> Set[str]:
+        """
+        Busca o documento inteiro por uma lista de valores de categoria exatos.
+        Este é o "motor" do fast-path.
+        
+        Args:
+            categories: Uma lista de strings de categoria (ex: ["vencido", "pago"]).
+            
+        Returns:
+            Um conjunto (set) dos valores de categoria (originais, não normalizados) 
+            que foram encontrados no texto.
+        """
+        # Normaliza as categorias para busca (ex: "ADVOGADO" -> "advogado")
+        norm_categories = {normalize_text(cat): cat for cat in categories}
+        found_categories = set()
+        
+        # Itera sobre todas as linhas do documento
+        for line in self.lines:
+            norm_line_text = normalize_text(line.text)
+            
+            # Verifica se alguma das nossas categorias está nesta linha
+            for norm_cat, original_cat in norm_categories.items():
+                
+                # Usa RegEx com \b (word boundary) para garantir que
+                # "pago" não corresponda a "pagamento".
+                pattern = r'\b' + re.escape(norm_cat) + r'\b'
+                
+                if re.search(pattern, norm_line_text):
+                    found_categories.add(original_cat) # Adiciona o valor ORIGINAL
+        
+        return found_categories
+
+    def get_categorical_snippets(self, categories: List[str]) -> set[Line]:
+        """
+        Busca o documento por categorias e retorna os OBJETOS Line
+        onde elas foram encontradas. (Para o 'retrieval' do LLM).
+        """
+        if not categories:
+            return set()
+            
+        norm_categories = {normalize_text(cat): cat for cat in categories}
+        found_lines = set()
+        
+        for line in self.lines:
+            norm_line_text = normalize_text(line.text)
+            
+            for norm_cat, original_cat in norm_categories.items():
+                pattern = r'\b' + re.escape(norm_cat) + r'\b'
+                
+                if re.search(pattern, norm_line_text):
+                    # Se encontrou, adiciona o OBJETO Line
+                    found_lines.add(line)
+                    # Otimização: uma vez que encontramos uma categoria
+                    # nesta linha, não precisamos verificar as outras.
+                    break 
+        
+        return found_lines

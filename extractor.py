@@ -1,4 +1,7 @@
 import time
+import re
+from typing import Dict, Any, Set, List 
+from collections import Counter, defaultdict 
 import concurrent.futures
 from openai import OpenAI
 from sentence_transformers import SentenceTransformer
@@ -7,7 +10,7 @@ from typing import Dict, Any
 import config
 from document import Document
 from llm_service import find_values_from_layout
-from text_utils import stopword_filter, calculate_stopwords
+from text_utils import stopword_filter, calculate_stopwords, normalize_text
 
 JACCARD_THRESHOLD = 0.95
 FULL_SCHEMAS = dict() # armazena schemas completos para análises futuras
@@ -39,6 +42,54 @@ class Extractor:
 
         print("Extrator pronto.")
 
+    def _parse_schema(self, extraction_schema: dict) -> (Dict[str, List[str]], Dict[str, List[str]]):
+        """
+        Analisa o schema UMA VEZ para criar dois mapas:
+        1. category_map: {key -> [cat1, cat2]}
+        2. global_cat_to_keys_map: {cat_norm -> [key1, key2]} (para verificação de ambiguidade)
+        """
+        print("  Analisando schema em busca de campos categóricos...")
+        category_map = {}
+        global_cat_to_keys_map = defaultdict(list)
+        
+        # --- MUDANÇA PRINCIPAL AQUI ---
+        # 1. GATILHO: Procura por "pode ser", "pode ser por", "pode ser feita por", "é efetuado por"
+        #    (da mais longa para a mais curta, para evitar matches parciais)
+        # 2. CAPTURA: Captura tudo "não-gulosamente" (.*?)
+        # 3. PARADA: Para no primeiro PONTO FINAL (.) ou no FIM DA STRING ($).
+        pattern = re.compile(
+            r"(?:pode ser (?:feita )?por|é efetuado por|pode ser por|pode ser)\s+(.*?)(?:\.|$)", 
+            re.IGNORECASE
+        )
+        # -------------------------------
+
+        for key, description in extraction_schema.items():
+            match = pattern.search(description)
+            if match:
+                # Captura o Grupo 1, que é a lista (ex: "vencido, pago ou pendente")
+                category_string = match.group(1)
+                
+                # A lógica de split (que já estava correta e alinhada com sua ideia)
+                # divide por vírgula OU pela palavra "ou" cercada de espaços.
+                categories = [
+                    cat.strip() for cat in 
+                    re.split(r',|\s+ou\s+', category_string) 
+                    if cat.strip()
+                ]
+                
+                if categories:
+                    print(f"    - Chave categórica encontrada: '{key}' -> {categories}")
+                    category_map[key] = categories
+                    
+                    # Constrói o mapa reverso
+                    for cat in categories:
+                        # Usamos normalize_text (do seu text_utils) aqui
+                        norm_cat = normalize_text(cat) 
+                        if key not in global_cat_to_keys_map[norm_cat]:
+                            global_cat_to_keys_map[norm_cat].append(key)
+        
+        return category_map, dict(global_cat_to_keys_map)
+
     def _calculate_jaccard(self, set1: frozenset[str], set2: frozenset[str]) -> float:
         """Calcula a Similaridade Jaccard entre dois conjuntos de snippets."""
         intersection = len(set1.intersection(set2))
@@ -51,12 +102,13 @@ class Extractor:
 
     def extract(self, label: str, extraction_schema: dict, fitz_page_dict: dict) -> dict:
         """
-        Pipeline baseline: Recupera âncoras, "infla" o contexto,
-        agrupa e extrai valores.
+        Pipeline: Fast Path Categórico Seguro, seguido por
+        Retrieval, Grouping e Extração LLM como fallback.
         """
         print(f"\n--- Processando Label: {label} ---")
         start_time = time.time()
-        # Update FULL_SCHEMAS
+        
+        # Mantém o cache de schema global
         FULL_SCHEMAS[label] = {**FULL_SCHEMAS.get(label, {}), **extraction_schema}
         
         if not self.embedding_model:
@@ -67,150 +119,167 @@ class Extractor:
             doc = Document(fitz_page_dict)
             doc.embed_spans(self.embedding_model)
             doc.find_tables()
-
         except ValueError as e:
             print(e)
             return {key: None for key in extraction_schema}
 
-        # --- PASSO 1: RECUPERAÇÃO DE "ÂNCORAS" ---
-        print("  Iniciando Passo 1: Recuperação de Âncoras...")
-        
-        # retrieved_anchors_by_key armazena os OBJETOS Line, não strings
-        retrieved_anchors_by_key: Dict[str, set[Line]] = {}
 
-        # find schema stopwords
-        descs = FULL_SCHEMAS[label].values()
-        stopwords = calculate_stopwords(list(descs), threshold=0.5)
-        
+        # --- PASSO 1: ANÁLISE DO SCHEMA ---
+        # (Substitui sua lógica de stopwords)
+        descs = list(FULL_SCHEMAS[label].values())
+        stopwords = calculate_stopwords(descs, threshold=0.5) # Sua função
+        category_map, global_cat_to_keys_map = self._parse_schema(FULL_SCHEMAS[label])
+
+        final_results = {}
+        keys_for_llm = [] # Chaves que falharam no fast-path
+
+        # --- PASSO 2: FAST PATH CATEGÓRICO (COM LÓGICA DE SEGURANÇA) ---
+        print("  Iniciando Passo 2: Fast Path Categórico Seguro...")
         for key, description in extraction_schema.items():
-            clean_description = stopword_filter(description, stopwords)
-            # 1a. Keyword Retrieval (retorna List[Line])
+            if key in category_map:
+                categories = category_map[key]
+                found_values_set = doc.search_for_categories(categories)
+                
+                # 1. Condição de Exclusividade Intra-Campo:
+                if len(found_values_set) == 1:
+                    found_value = list(found_values_set)[0]
+                    norm_found_value = normalize_text(found_value)
+                    
+                    # 2. Condição de Exclusividade Inter-Campo:
+                    keys_sharing_this_category = global_cat_to_keys_map.get(norm_found_value, [])
+                    
+                    if len(keys_sharing_this_category) == 1 and keys_sharing_this_category[0] == key:
+                        # SUCESSO! É inequívoco.
+                        final_results[key] = found_value
+                        print(f"    [FAST PATH HIT] Chave '{key}' resolvida localmente (Inequívoca): '{found_value}'")
+                        continue # Pula para a próxima chave
+                    else:
+                        print(f"    [FAST PATH FAIL] Chave '{key}' ambígua. Categoria '{found_value}' é compartilhada por {keys_sharing_this_category}.")
+                
+                elif len(found_values_set) > 1:
+                    print(f"    [FAST PATH FAIL] Chave '{key}' ambígua. Múltiplos valores encontrados: {found_values_set}")
+                else:
+                    print(f"    [FAST PATH FAIL] Chave '{key}' não encontrada. Enviando para LLM.")
+
+            # Se qualquer falha ocorrer, ou se não for categórica,
+            # a chave é adicionada para o pipeline do LLM.
+            keys_for_llm.append(key)
+        
+        # Se não houver chaves restantes, podemos pular tudo
+        if not keys_for_llm:
+            end_time = time.time()
+            print(f"--- Processamento Concluído (APENAS FAST PATH) em {end_time - start_time:.2f} segundos ---")
+            # Garante que todas as chaves solicitadas estejam presentes
+            for key in extraction_schema:
+                if key not in final_results: final_results[key] = None
+            return final_results
+
+        print(f"  -> Fast Path concluído em {end_time_fast - start_time_fast:.2f} segundos.")
+
+        # --- PASSO 3: RECUPERAÇÃO (RETRIEVAL) - Apenas para chaves do LLM ---
+        print(f"  Iniciando Passo 3: Recuperação de Âncoras (para {len(keys_for_llm)} chaves)...")
+        retrieved_anchors_by_key: Dict[str, set[Line]] = {}
+        
+        for key in keys_for_llm:
+            description = extraction_schema[key]
+            clean_description = stopword_filter(description, stopwords) # Sua função
+            
+            # 3a. Keyword Retrieval (retorna set[Line])
             kw_lines = doc.get_keyword_matching_lines(key)
             
-            # 1b. Positional Retrieval (retorna List[Line])
-            pos_lines = doc.get_positional_matching_lines(description)           
-
-            # 1c. Semantic Retrieval (retorna List[Line])
+            # 3b. Positional Retrieval (retorna set[Line])
+            pos_lines = doc.get_positional_matching_lines(description)
+            
+            # 3c. Categorical Retrieval (NOVO)
+            cat_lines = doc.get_categorical_snippets(category_map.get(key, []))
+            
+            # 3d. Semantic Retrieval (retorna set[Line])
             query = f"{key}: {clean_description}"
-            k = max(0, config.SNIPPET_K_SEMANTIC - len(kw_lines))
+            k = max(0, config.SNIPPET_K_SEMANTIC - len(kw_lines) - len(pos_lines) - len(cat_lines))
             sem_lines = doc.get_semantic_matching_lines(self.embedding_model, query, k=k)
-
-            # 1d. Combina os objetos Line
-            context_set = set(kw_lines).union(set(sem_lines)).union(set(pos_lines))
+            
+            # 3e. Combina os objetos Line
+            context_set = set(kw_lines).union(set(sem_lines)).union(set(pos_lines)).union(cat_lines)
             retrieved_anchors_by_key[key] = context_set
 
-
-        # --- PASSO 2: INFLAR O CONTEXTO E AGRUPAR ---
-        print("  Iniciando Passo 2: Inflar Contexto e Agrupar Chaves...")
-        
-        # Agora, a "assinatura" de uma chave é o seu CONTEXTO INFLADO
-        retrieved_snippets_by_key: Dict[str, frozenset[str]] = {}
+        # --- PASSO 4: INFLAR O CONTEXTO E AGRUPAR ---
+        print("  Iniciando Passo 4: Inflar Contexto e Agrupar Chaves...")
+        retrieved_snippets_by_key: Dict[str, frozenset[int]] = {} # Armazena line INDICES
         
         for key, anchor_lines in retrieved_anchors_by_key.items():
             inflated_snippets = set()
             if not anchor_lines:
-                # Se não encontrou âncoras, a assinatura está vazia
                 retrieved_snippets_by_key[key] = frozenset()
                 continue
             
-            # "Infla" o contexto para cada âncora encontrada
             for line in anchor_lines:
-                context_lines = doc.get_context_for_line(line)
-                inflated_snippets.update(context_lines)
-
+                context_lines_indices = doc.get_context_for_line(line) # Retorna Set[int]
+                inflated_snippets.update(context_lines_indices)
             
-            # A "assinatura" da chave é o conjunto de todos os seus
-            # snippets de contexto inflado
             retrieved_snippets_by_key[key] = frozenset(inflated_snippets)
 
-
-        # --- PASSO 3: AGRUPAMENTO (BATCHING) ---
-        # (Esta lógica não muda, mas agora opera em assinaturas de contexto
-        # muito mais ricas e precisas)
+        # --- PASSO 5: AGRUPAMENTO (BATCHING) ---
+        print("  Iniciando Passo 5: Agrupamento (Jaccard)...")
         clusters = []
         keys_without_snippets = set()
-        for key, snippets in retrieved_snippets_by_key.items():
+        for key in keys_for_llm: # Itera apenas nas chaves do LLM
+            snippets = retrieved_snippets_by_key.get(key, frozenset())
             if not snippets:
                 keys_without_snippets.add(key)
                 continue
-            clusters.append({
-                'keys': {key},
-                'snippets': snippets
-            })
+            clusters.append({'keys': {key}, 'snippets': snippets})
 
-        # 2. Loop de clustering aglomerativo
+        # (Lógica de clustering Jaccard não muda)
         while True:
             best_score = -1
-            best_pair_to_merge = None # (index_i, index_j)
-
-            # Encontra o melhor par para fundir (O(n^2), aceitável para N < 100)
+            best_pair_to_merge = None
             for i in range(len(clusters)):
                 for j in range(i + 1, len(clusters)):
-                    c1 = clusters[i]
-                    c2 = clusters[j]
-                    
+                    c1, c2 = clusters[i], clusters[j]
                     score = self._calculate_jaccard(c1['snippets'], c2['snippets'])
-                    
                     if score > best_score:
                         best_score = score
                         best_pair_to_merge = (i, j)
             
-            # 3. Decide se funde ou para
             if best_pair_to_merge and best_score >= JACCARD_THRESHOLD:
                 i, j = best_pair_to_merge
-                
-                # Para evitar reindexação, pegamos os índices em ordem decrescente
                 c2 = clusters.pop(max(i, j))
                 c1 = clusters.pop(min(i, j))
-                
-                # Cria o novo cluster fundido
                 merged_cluster = {
                     'keys': c1['keys'].union(c2['keys']),
                     'snippets': c1['snippets'].union(c2['snippets'])
                 }
-                
-                clusters.append(merged_cluster) # Adiciona de volta à lista
-                # E continua o loop para encontrar o próximo melhor merge
+                clusters.append(merged_cluster)
             else:
-                # Não há mais merges possíveis acima do limite
                 break 
 
-        # 4. Coleta os grupos finais
         final_groups: list[Set[str]] = [c['keys'] for c in clusters]
-        
-        # Adiciona as chaves que não tinham snippets como seu próprio grupo
         if keys_without_snippets:
             final_groups.append(keys_without_snippets)
-        
         print(f"  -> Grupos de extração formados: {[list(g) for g in final_groups]}")
 
-        # --- PASSO 4: EXTRAÇÃO (LLM EM PARALELO) ---
-        print("  Iniciando Passo 4: Extração via LLM (Paralelizada)...")
-        final_results = {}
+        # --- PASSO 6: EXTRAÇÃO (LLM EM PARALELO) ---
+        print("  Iniciando Passo 6: Extração via LLM (Paralelizada)...")
         
-        # Define um número máximo de chamadas simultâneas
-        # para evitar ser bloqueado pela API (Rate Limit)
         MAX_CONCURRENT_CALLS = 5 
-        
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CALLS) as executor:
-            # Dicionário para mapear "futuros" de volta para seus grupos
             future_to_group = {}
             
             for key_group_set in final_groups:
-                all_snippets = set().union(*(retrieved_snippets_by_key[key] for key in key_group_set))
+                all_snippets_indices = set().union(*(retrieved_snippets_by_key.get(key, set()) for key in key_group_set))
                 
-                if not all_snippets:
+                if not all_snippets_indices:
                     for key in key_group_set:
                         final_results[key] = None
-                    break
-                    
-                lines_sorted = sorted([doc.lines[i] for i in all_snippets])
+                    continue
+                
+                # Converte os índices de volta para objetos Line e serializa
+                lines_sorted = sorted([doc.lines[i] for i in all_snippets_indices], key=lambda l: l.idx)
                 context = "\n---\n".join([line.serialize_layout() for line in lines_sorted])
+                
                 schema_group = {key: extraction_schema[key] for key in key_group_set}
                 print(f"  Submetendo chamada para o GRUPO: {list(key_group_set)}...")
                 
-                
-                # Submete a tarefa para a pool de threads
                 future = executor.submit(
                     find_values_from_layout,
                     self.client, 
@@ -219,22 +288,21 @@ class Extractor:
                 )
                 future_to_group[future] = key_group_set
 
-            # Coleta os resultados à medida que ficam prontos
             for future in concurrent.futures.as_completed(future_to_group):
                 key_group_set = future_to_group[future]
                 try:
-                    # Pega o resultado da thread
                     llm_values = future.result()
                     final_results.update(llm_values)
                     print(f"  -> Resultado recebido para o GRUPO: {list(key_group_set)}")
                 except Exception as e:
                     print(f"ERRO: A thread para o grupo {list(key_group_set)} falhou: {e}")
                     for key in key_group_set:
-                        final_results[key] = None # Garante 'None' em caso de falha
+                        final_results[key] = None
 
         end_time = time.time()
         print(f"--- Processamento Concluído em {end_time - start_time:.2f} segundos ---")
         
+        # Garante que todas as chaves solicitadas tenham pelo menos um 'None'
         for key in extraction_schema:
             if key not in final_results:
                 final_results[key] = None
