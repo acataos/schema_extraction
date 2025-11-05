@@ -83,17 +83,22 @@ class Extractor:
         stopwords = calculate_stopwords(list(descs), threshold=0.5)
         
         for key, description in extraction_schema.items():
-            description = stopword_filter(description, stopwords)
+            clean_description = stopword_filter(description, stopwords)
             # 1a. Keyword Retrieval (retorna List[Line])
             kw_lines = doc.get_keyword_matching_lines(key)
             
-            # 1b. Semantic Retrieval (retorna List[Line])
-            query = f"{key}: {description}"
-            sem_lines = doc.get_semantic_matching_lines(self.embedding_model, query, k=config.SNIPPET_K_SEMANTIC-len(kw_lines))
-            
-            # 1c. Combina os objetos Line
-            context_set = set(kw_lines).union(set(sem_lines))
+            # 1b. Positional Retrieval (retorna List[Line])
+            pos_lines = doc.get_positional_matching_lines(description)           
+
+            # 1c. Semantic Retrieval (retorna List[Line])
+            query = f"{key}: {clean_description}"
+            k = max(0, config.SNIPPET_K_SEMANTIC - len(kw_lines))
+            sem_lines = doc.get_semantic_matching_lines(self.embedding_model, query, k=k)
+
+            # 1d. Combina os objetos Line
+            context_set = set(kw_lines).union(set(sem_lines)).union(set(pos_lines))
             retrieved_anchors_by_key[key] = context_set
+
 
         # --- PASSO 2: INFLAR O CONTEXTO E AGRUPAR ---
         print("  Iniciando Passo 2: Inflar Contexto e Agrupar Chaves...")
@@ -110,13 +115,14 @@ class Extractor:
             
             # "Infla" o contexto para cada âncora encontrada
             for line in anchor_lines:
-                context_lines = doc.get_context_for_line(line, window_size=2)
+                context_lines = doc.get_context_for_line(line)
                 inflated_snippets.update(context_lines)
 
             
             # A "assinatura" da chave é o conjunto de todos os seus
             # snippets de contexto inflado
             retrieved_snippets_by_key[key] = frozenset(inflated_snippets)
+
 
         # --- PASSO 3: AGRUPAMENTO (BATCHING) ---
         # (Esta lógica não muda, mas agora opera em assinaturas de contexto
@@ -177,35 +183,6 @@ class Extractor:
             final_groups.append(keys_without_snippets)
         
         print(f"  -> Grupos de extração formados: {[list(g) for g in final_groups]}")
-        # groups = [{key} for key in extraction_schema.keys()]
-        # merged_groups = []
-        # while groups:
-        #     current_group = groups.pop(0)
-        #     current_snippets = set().union(*(retrieved_snippets_by_key[key] for key in current_group))
-        #     if not current_snippets: # Grupo de chaves sem contexto
-        #         merged_groups.append(current_group)
-        #         continue
-        #
-        #     merged_with_current = False
-        #     remaining_groups = []
-        #     for other_group in groups:
-        #         other_snippets = set().union(*(retrieved_snippets_by_key[key] for key in other_group))
-        #         if not other_snippets:
-        #             remaining_groups.append(other_group)
-        #             continue
-        #
-        #         if not current_snippets.isdisjoint(other_snippets):
-        #             current_group.update(other_group)
-        #             merged_with_current = True
-        #         else:
-        #             remaining_groups.append(other_group)
-        #
-        #     if merged_with_current:
-        #         groups = [current_group] + remaining_groups
-        #     else:
-        #         merged_groups.append(current_group)
-        #
-        # print(f"  -> Grupos de extração formados: {[list(g) for g in merged_groups]}")
 
         # --- PASSO 4: EXTRAÇÃO (LLM EM PARALELO) ---
         print("  Iniciando Passo 4: Extração via LLM (Paralelizada)...")
@@ -223,16 +200,15 @@ class Extractor:
                 all_snippets = set().union(*(retrieved_snippets_by_key[key] for key in key_group_set))
                 
                 if not all_snippets:
-                    print(f"  GRUPO {list(key_group_set)} não teve snippets. Retornando None.")
                     for key in key_group_set:
                         final_results[key] = None
-                    continue
-
+                    break
+                    
                 lines_sorted = sorted([doc.lines[i] for i in all_snippets])
                 context = "\n---\n".join([line.serialize_layout() for line in lines_sorted])
                 schema_group = {key: extraction_schema[key] for key in key_group_set}
-                
                 print(f"  Submetendo chamada para o GRUPO: {list(key_group_set)}...")
+                
                 
                 # Submete a tarefa para a pool de threads
                 future = executor.submit(
@@ -262,5 +238,6 @@ class Extractor:
         for key in extraction_schema:
             if key not in final_results:
                 final_results[key] = None
+        print("Resultados Finais:", final_results)
                 
         return final_results
