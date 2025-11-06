@@ -424,13 +424,11 @@ class Extractor:
                 schema_group = {key: extraction_schema[key] for key in key_group_set}
                 # print(f"  Submetendo chamada para o GRUPO: {list(key_group_set)}...")
                 
-                excluded_schema_group = dict([(k,v) for k,v in FULL_SCHEMAS[label].items() if k not in key_group_set])
                 future = executor.submit(
                     find_values_from_layout,
                     self.client, 
                     context, 
                     schema_group,
-                    excluded_schema_group,
                 )
                 future_to_group[future] = key_group_set
 

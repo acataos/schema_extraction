@@ -3,7 +3,7 @@ from openai import OpenAI
 import config
 from typing import Dict
 
-def find_values_from_layout(client: OpenAI, context: str, schema_group: Dict[str, str], excluded_schema_group: Dict[str, str]) -> Dict[str, any]:
+def find_values_from_layout(client: OpenAI, context: str, schema_group: Dict[str, str]) -> Dict[str, any]:
     """
     Chama o LLM para extrair um GRUPO de valores, dado um contexto de layout.
     
@@ -14,10 +14,6 @@ def find_values_from_layout(client: OpenAI, context: str, schema_group: Dict[str
     schema_prompt = ""
     for key, description in schema_group.items():
         schema_prompt += f"  - Chave: '{key}', Descrição: '{description}'\n"
-
-    excluded_schema_prompt = ""
-    for key, description in excluded_schema_group.items():
-        excluded_schema_prompt += f"  - Chave: '{key}', Descrição: '{description}'\n"
 
     # 2. Constrói os prompts do sistema e do usuário
     system_prompt = """
@@ -49,9 +45,6 @@ def find_values_from_layout(client: OpenAI, context: str, schema_group: Dict[str
     GRUPO DE CAMPOS PARA EXTRAIR:
     {schema_prompt}
     ---
-    GRUPO DE CAMPOS EXCLUÍDOS (não considerar estes campos):
-    {excluded_schema_prompt}
-    ---
     OBJETO JSON DE RESPOSTA (apenas valores):
     """
 
@@ -69,7 +62,7 @@ def find_values_from_layout(client: OpenAI, context: str, schema_group: Dict[str
             ],
             response_format={"type": "json_object"}
         )
-        response_text = response.choices[0].message.content
+        # response_text = response.choices[0].message.content
         # debug_str = f"""\n\n
         #     Chamando LLM para extração de grupo de campos...
         #     {human_prompt}
