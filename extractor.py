@@ -11,7 +11,8 @@ import config
 from document import Document
 from llm_service import find_values_from_layout
 from thefuzz import fuzz
-from text_utils import stopword_filter, calculate_stopwords, normalize_text
+from text_utils import stopword_filter, calculate_stopwords, normalize_text, is_isolated_word_in
+from pattern_utils import PATTERN_KEYWORDS, STRONG_PATTERNS
 
 JACCARD_THRESHOLD = 0.6
 FULL_SCHEMAS = dict() # armazena schemas completos para análises futuras
@@ -41,8 +42,8 @@ class Extractor:
         if not self.embedding_model:
             print("AVISO: Extractor inicializado sem modelo de embedding.")
 
-        # print("Extrator pronto.")
 
+        self.description_embedding_cache = {}
 
     def _parse_schema(self, extraction_schema: dict) -> (Dict[str, List[str]], Dict[str, List[str]], Dict[str, str]):
         """
@@ -55,6 +56,7 @@ class Extractor:
         category_map = {}
         global_cat_to_keys_map = defaultdict(list)
         pattern_map = {} # <-- NOSSO NOVO MAPA
+        strong_pattern_map = {} # <-- MAPA DE PADRÕES FORTES
         
         # Padrão RegEx para Categorias (ex: "pode ser A, B ou C")
         cat_pattern = re.compile(
@@ -64,31 +66,6 @@ class Extractor:
         
         # Mapeamento de palavras-chave para tipos de padrão
         # (A ordem importa: "cnpj" deve vir antes de "id")
-        PATTERN_KEYWORDS = {
-            "cpf": "cpf",
-            "cnpj": "cnpj",
-            "cnh": "cnh",
-            "habilitacao": "cnh",
-            "cns": "cns",
-            "pis": "pis",
-            "identidade": "rg",
-            "rg": "rg",
-            "renavam": "renavam",
-            "titulo_eleitoral": "titulo_eleitoral",
-            "telefone": "phone",
-            "celular": "phone",
-            "data": "date",
-            "valor": "money",
-            "dinheiro": "money",
-            "quantia": "money",
-            "saldo": "money",
-            # "quantidade": "quantity",
-            "endereco": "cep",
-            "logradouro": "cep",
-            "contrato": "id",
-            "numero": "id",
-            "codigo": "id",
-        }
 
         for key, description in extraction_schema.items():
             norm_desc = normalize_text(description)
@@ -115,12 +92,14 @@ class Extractor:
             # (Não executa se já for categórico, para evitar confusão)
             if key not in category_map:
                 for keyword, pattern_type in PATTERN_KEYWORDS.items():
+                    if keyword in STRONG_PATTERNS and is_isolated_word_in(key, keyword): 
+                        strong_pattern_map[key] = pattern_type
                     if keyword in norm_desc or keyword in normalize_text(key):
                         # print(f"    - Chave de padrão encontrada: '{key}' -> tipo '{pattern_type}'")
                         pattern_map[key] = pattern_type
                         break # Pára no primeiro padrão encontrado
         
-        return category_map, dict(global_cat_to_keys_map), pattern_map
+        return category_map, dict(global_cat_to_keys_map), pattern_map, strong_pattern_map
 
     def _calculate_jaccard(self, set1: frozenset[str], set2: frozenset[str]) -> float:
         """Calcula a Similaridade Jaccard entre dois conjuntos de snippets."""
@@ -153,14 +132,14 @@ class Extractor:
 
     def _get_key_similarity_map(self, full_schema: dict, 
                                 name_threshold: int = 80, 
-                                desc_threshold: float = 0.7,
+                                desc_threshold: float = 0.8,
                                 stopwords: Set[str] = None) -> Dict[str, Set[str]]:
         """
         Compara todas as chaves contra si mesmas usando uma abordagem HÍBRIDA:
         1. Similaridade Sintática (fuzz) nos NOMES das chaves.
         2. Similaridade Semântica (embeddings) nas DESCRIÇÕES.
         """
-        print("  Construindo mapa de similaridade de chaves (Híbrido)...")
+        # print("  Construindo mapa de similaridade de chaves (Híbrido)...")
         
         key_to_similar_keys = defaultdict(set)
         
@@ -180,13 +159,19 @@ class Extractor:
             for j in range(i + 1, len(keys_list)):
                 key_a = keys_list[i]
                 key_b = keys_list[j]
-                
                 is_similar = False # Flag de similaridade
 
-                # --- Teste 1: Similaridade de Nome (Sintática) ---
-                name_score = fuzz.ratio(key_to_norm_name[key_a], key_to_norm_name[key_b])
-                if name_score >= name_threshold:
-                    is_similar = True
+                for pattern in STRONG_PATTERNS:
+                    has_pattern_a = is_isolated_word_in(key_a, pattern)
+                    has_pattern_b = is_isolated_word_in(key_b, pattern)
+                    if has_pattern_a and has_pattern_b:
+                        is_similar = True
+                
+                if not is_similar:
+                    # --- Teste 1: Similaridade de Nome (Sintática) ---
+                    name_score = fuzz.ratio(key_to_norm_name[key_a], key_to_norm_name[key_b])
+                    if name_score >= name_threshold:
+                        is_similar = True
 
                 # --- Teste 2: Similaridade de Descrição (Semântica) ---
                 if not is_similar: # Só executa se o Teste 1 falhar
@@ -223,7 +208,6 @@ class Extractor:
             print("ERRO: Modelo de embedding não carregado. Abortando.")
             return {key: None for key in extraction_schema}
 
-        self.description_embedding_cache = {}
             
         try:
             doc = Document(fitz_page_dict)
@@ -240,19 +224,17 @@ class Extractor:
         all_keys = set(FULL_SCHEMAS[label].keys())
         missing_keys = all_keys - set(extraction_schema.keys())
         stopwords = calculate_stopwords(descs, threshold=0.5) # Sua função
-        category_map, global_cat_to_keys_map, pattern_map = self._parse_schema(FULL_SCHEMAS[label])
+        category_map, global_cat_to_keys_map, pattern_map, strong_pattern_map = self._parse_schema(FULL_SCHEMAS[label])
         key_similarity_map = self._get_key_similarity_map(FULL_SCHEMAS[label], stopwords=stopwords)
-        print("  Mapa de similaridade de chaves construído.")
-        print(f"    Chaves faltantes: {missing_keys}")
-        print(" key_similarity_map:", {k: list(v) for k,v in key_similarity_map.items() if v})
-        breakpoint()
+        # print("  Mapa de similaridade de chaves construído.")
+        # print("Strong Pattern Map:", strong_pattern_map)
+        # print("Similarity Map:", {k: list(v) for k, v in key_similarity_map.items()})
 
         final_results = {}
         keys_for_llm = [] # Chaves que falharam no fast-path
 
         # --- PASSO 2: FAST PATH CATEGÓRICO (COM LÓGICA DE SEGURANÇA) ---
-        # print("  Iniciando Passo 2: Fast Path Categórico Seguro...")
-        for key, description in extraction_schema.items():
+        for key, description in FULL_SCHEMAS[label].items():
             if key in category_map:
                 categories = category_map[key]
                 found_values_set = doc.search_for_categories(categories)
@@ -266,26 +248,76 @@ class Extractor:
                     keys_sharing_this_category = global_cat_to_keys_map.get(norm_found_value, [])
                     
                     if len(keys_sharing_this_category) == 1 and keys_sharing_this_category[0] == key:
-                        # SUCESSO! É inequívoco.
-                        final_results[key] = found_value
-                        # print(f"    [FAST PATH HIT] Chave '{key}' resolvida localmente (Inequívoca): '{found_value}'")
-                        continue # Pula para a próxima chave
+                        if key in extraction_schema:
+                            #mask it
+                            final_results[key] = found_value
+                        else:
+                            #mask it
+                            pass
                     else:
                         pass
-                        # print(f"    [FAST PATH FAIL] Chave '{key}' ambígua. Categoria '{found_value}' é compartilhada por {keys_sharing_this_category}.")
                 
                 elif len(found_values_set) > 1:
                     pass
-                    # print(f"    [FAST PATH FAIL] Chave '{key}' ambígua. Múltiplos valores encontrados: {found_values_set}")
                 # achou nada => nao tem
-                else:
+                elif key in extraction_schema:
                     final_results[key] = None
-                    # print(f"    [FAST PATH FAIL] Chave '{key}' não encontrada. Assumimos que seu valor é null.")
-                    continue
+
+            elif key in strong_pattern_map:
+                pattern_type = pattern_map[key]
+                
+                # 1. Busca pela "Label" (Âncora)
+                anchor_lines = doc.get_keyword_matching_lines(key) 
+                
+                # 2. Grade de Segurança 1: Unicidade
+                value_candidate_texts = [] # O texto que vamos validar
+                for anchor_line in anchor_lines:
+                    # 3. Heurística de Busca Espacial
+                    # Heurística A: O valor está na mesma caixa? (Ex: "CPF: 123.456...")
+                    for box in anchor_line.boxes:
+                        if ":" in box.text:
+                            parts = box.text.split(":", 1)
+                            key_part = parts[0]
+                            val_part = parts[1].strip()
+                            # Compara a chave (label) com a 1ª parte
+                            if fuzz.ratio(normalize_text(key), normalize_text(key_part)) > 90 and val_part:
+                                value_candidate_texts.append(val_part)
+                        box_text = normalize_text(box.text)
+                        key_text = normalize_text(key).replace("_", " ")
+                        if fuzz.ratio(box_text, key_text) > 90:
+                            # check box to the right
+                            box_to_right = doc.find_close_box(box, 'right')
+                            if box_to_right:
+                                value_candidate_texts.append(box_to_right.text)
+                            # check box below
+                            box_below = doc.find_close_box(box, 'below')
+                            if box_below:
+                                value_candidate_texts.append(box_below.text)
+
+                    # 4. Grade de Segurança 2: Validação de Padrão
+                values_to_remove = set()
+                for value_candidate_text in value_candidate_texts:
+                    if not doc.validate_string(value_candidate_text, pattern_type):
+                        values_to_remove.add(value_candidate_text)
+                value_candidate_texts = set(value_candidate_texts) - values_to_remove
+
+                if len(value_candidate_texts)==1:
+                    value_candidate_text = value_candidate_texts.pop()
+                    # Chama nosso novo método validador no Document
+                    print(f"    [FAST PATH HIT] Chave de Padrão '{key}' resolvida: '{value_candidate_text}'")
+                    if key in extraction_schema:
+                        # mask it
+                        final_results[key] = value_candidate_text
+                    else:
+                        # mask it
+                        pass
+                    continue # Sucesso! Pula para a próxima chave
+            
 
             # Se qualquer falha ocorrer, ou se não for categórica,
             # a chave é adicionada para o pipeline do LLM.
-            keys_for_llm.append(key)
+            if key in extraction_schema:
+                keys_for_llm.append(key)
         
         # Se não houver chaves restantes, podemos pular tudo
         if not keys_for_llm:
@@ -402,10 +434,19 @@ class Extractor:
                 keys_to_merge = similar_keys.intersection(missing_keys)
                 all_similar_keys_for_group.update(keys_to_merge)
             
-            merged_groups.append(current_group)
+            merged_groups.append(all_similar_keys_for_group.union(current_group))
         
         final_groups: List[Set[str]] = merged_groups
         MAX_CONCURRENT_CALLS = 5 
+        start_serialize = time.time()
+        for key_group_set in final_groups:
+            all_snippets_indices = set().union(*(retrieved_snippets_by_key.get(key, set()) for key in key_group_set))
+            context = doc.serialize_snippets_for_llm(all_snippets_indices)
+        end_serialize = time.time()
+
+        print(f"--- Tempo de serialização de snippets: {end_serialize - start_serialize:.2f} segundos ---")
+
+        llm_start_time = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CALLS) as executor:
             future_to_group = {}
             
@@ -421,7 +462,7 @@ class Extractor:
                 # lines_sorted = sorted([doc.lines[i] for i in all_snippets_indices], key=lambda l: l.idx)
                 context = doc.serialize_snippets_for_llm(all_snippets_indices)
                 
-                schema_group = {key: extraction_schema[key] for key in key_group_set}
+                schema_group = {key: FULL_SCHEMAS[label][key] for key in key_group_set}
                 # print(f"  Submetendo chamada para o GRUPO: {list(key_group_set)}...")
                 
                 future = executor.submit(
@@ -444,12 +485,16 @@ class Extractor:
                         final_results[key] = None
 
         end_time = time.time()
-        # print(f"--- Processamento Concluído em {end_time - start_time:.2f} segundos ---")
+        print(f"--- Processamento Concluído em {end_time - start_time:.2f} segundos ---")
+        print(f"--- Processamento por LLM concluído em {end_time - llm_start_time:.2f} segundos ---")
         
         # Garante que todas as chaves solicitadas tenham pelo menos um 'None'
         for key in extraction_schema:
             if key not in final_results:
                 final_results[key] = None
+        for key in missing_keys:
+            if key in final_results:
+                del final_results[key]
         print("Resultados Finais:", final_results)
                 
         return final_results

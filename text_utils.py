@@ -112,3 +112,16 @@ def stopword_filter(text: str, stopwords: set[str]) -> str:
     filtered_words = [word for word in words if normalize_text(word, noise_chars) not in stopwords]
     
     return ' '.join(filtered_words)
+
+def is_isolated_word_in(text: str, word: str) -> bool:
+    """Verifica se 'word' aparece como palavra isolada em 'text'."""
+    if not text or not word:
+        return False
+    
+    normalized_text = normalize_text(text)
+    normalized_word = normalize_text(word)
+    normalized_text = normalized_text.replace("_"," ")
+    normalized_word = normalized_word.replace("_"," ")
+    
+    words = normalized_text.split()
+    return normalized_word in words
