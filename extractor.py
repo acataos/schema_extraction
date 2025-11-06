@@ -4,12 +4,13 @@ from typing import Dict, Any, Set, List
 from collections import Counter, defaultdict 
 import concurrent.futures
 from openai import OpenAI
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, util
 from typing import Dict, Any
 
 import config
 from document import Document
 from llm_service import find_values_from_layout
+from thefuzz import fuzz
 from text_utils import stopword_filter, calculate_stopwords, normalize_text
 
 JACCARD_THRESHOLD = 0.6
@@ -18,7 +19,7 @@ FULL_SCHEMAS = dict() # armazena schemas completos para análises futuras
 # Carregamos os modelos globalmente
 try:
     EMBEDDING_MODEL = SentenceTransformer(
-        config.EMBEDDING_MODEL_NAME, 
+        config.EMBEDDING_MODEL_PATH, 
         device=config.DEVICE
     )
     print(f"Modelo de embedding carregado em: {config.DEVICE}")
@@ -131,6 +132,82 @@ class Extractor:
         
         return intersection / union
 
+    def _get_cached_embedding(self, text: str) -> Any:
+        """
+        Gera ou recupera um embedding do cache para um determinado texto (descrição).
+        """
+        if text in self.description_embedding_cache:
+            return self.description_embedding_cache[text]
+        
+        if not self.embedding_model:
+            return None # Não pode gerar embeddings
+
+        # Gera, armazena no cache e retorna
+        try:
+            embedding = self.embedding_model.encode(text, convert_to_tensor=True)
+            self.description_embedding_cache[text] = embedding
+            return embedding
+        except Exception as e:
+            print(f"AVISO: Falha ao gerar embedding para o texto: {text}. Erro: {e}")
+            return None
+
+    def _get_key_similarity_map(self, full_schema: dict, 
+                                name_threshold: int = 80, 
+                                desc_threshold: float = 0.7,
+                                stopwords: Set[str] = None) -> Dict[str, Set[str]]:
+        """
+        Compara todas as chaves contra si mesmas usando uma abordagem HÍBRIDA:
+        1. Similaridade Sintática (fuzz) nos NOMES das chaves.
+        2. Similaridade Semântica (embeddings) nas DESCRIÇÕES.
+        """
+        print("  Construindo mapa de similaridade de chaves (Híbrido)...")
+        
+        key_to_similar_keys = defaultdict(set)
+        
+        # 1. Pré-processa todos os nomes e embeddings (para eficiência N*N)
+        key_to_norm_name = {}
+        key_to_embedding = {}
+        
+        for key, desc in full_schema.items():
+            key_to_norm_name[key] = normalize_text(key.replace("_", " "))
+            clean_desc = stopword_filter(desc, stopwords)
+            key_to_embedding[key] = self._get_cached_embedding(clean_desc)
+
+        keys_list = list(full_schema.keys())
+
+        # 2. Compara todos os pares
+        for i in range(len(keys_list)):
+            for j in range(i + 1, len(keys_list)):
+                key_a = keys_list[i]
+                key_b = keys_list[j]
+                
+                is_similar = False # Flag de similaridade
+
+                # --- Teste 1: Similaridade de Nome (Sintática) ---
+                name_score = fuzz.ratio(key_to_norm_name[key_a], key_to_norm_name[key_b])
+                if name_score >= name_threshold:
+                    is_similar = True
+
+                # --- Teste 2: Similaridade de Descrição (Semântica) ---
+                if not is_similar: # Só executa se o Teste 1 falhar
+                    emb_a = key_to_embedding[key_a]
+                    emb_b = key_to_embedding[key_b]
+                    
+                    if emb_a is not None and emb_b is not None:
+                        try:
+                            desc_score = util.cos_sim(emb_a, emb_b).item()
+                            if desc_score >= desc_threshold:
+                                is_similar = True
+                        except Exception as e:
+                            print(f"AVISO: Falha no cos_sim entre '{key_a}' e '{key_b}': {e}")
+                
+                # --- Adiciona ao mapa se UMA das condições for verdadeira ---
+                if is_similar:
+                    key_to_similar_keys[key_a].add(key_b)
+                    key_to_similar_keys[key_b].add(key_a)
+                    
+        return key_to_similar_keys
+
     def extract(self, label: str, extraction_schema: dict, fitz_page_dict: dict) -> dict:
         """
         Pipeline: Fast Path Categórico Seguro, seguido por
@@ -145,6 +222,8 @@ class Extractor:
         if not self.embedding_model:
             print("ERRO: Modelo de embedding não carregado. Abortando.")
             return {key: None for key in extraction_schema}
+
+        self.description_embedding_cache = {}
             
         try:
             doc = Document(fitz_page_dict)
@@ -158,8 +237,15 @@ class Extractor:
         # --- PASSO 1: ANÁLISE DO SCHEMA ---
         # (Substitui sua lógica de stopwords)
         descs = list(FULL_SCHEMAS[label].values())
+        all_keys = set(FULL_SCHEMAS[label].keys())
+        missing_keys = all_keys - set(extraction_schema.keys())
         stopwords = calculate_stopwords(descs, threshold=0.5) # Sua função
         category_map, global_cat_to_keys_map, pattern_map = self._parse_schema(FULL_SCHEMAS[label])
+        key_similarity_map = self._get_key_similarity_map(FULL_SCHEMAS[label], stopwords=stopwords)
+        print("  Mapa de similaridade de chaves construído.")
+        print(f"    Chaves faltantes: {missing_keys}")
+        print(" key_similarity_map:", {k: list(v) for k,v in key_similarity_map.items() if v})
+        breakpoint()
 
         final_results = {}
         keys_for_llm = [] # Chaves que falharam no fast-path
@@ -299,11 +385,26 @@ class Extractor:
             else:
                 break 
 
-        final_groups: list[Set[str]] = [c['keys'] for c in clusters]
+        key_groups: list[Set[str]] = [c['keys'] for c in clusters]
         if keys_without_snippets:
-            final_groups.append(keys_without_snippets)
+            key_groups.append(keys_without_snippets)
         # print(f"  -> Grupos de extração formados: {[list(g) for g in final_groups]}")
-
+        merged_groups = []
+        while key_groups:
+            current_group = key_groups.pop(0)
+            merged_with_current = False
+            remaining_groups = []
+            
+            # Pega TODAS as chaves faltantes similares a QUALQUER chave neste grupo
+            all_similar_keys_for_group = set()
+            for key in current_group:
+                similar_keys = key_similarity_map.get(key, set())
+                keys_to_merge = similar_keys.intersection(missing_keys)
+                all_similar_keys_for_group.update(keys_to_merge)
+            
+            merged_groups.append(current_group)
+        
+        final_groups: List[Set[str]] = merged_groups
         MAX_CONCURRENT_CALLS = 5 
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CALLS) as executor:
             future_to_group = {}
@@ -351,6 +452,6 @@ class Extractor:
         for key in extraction_schema:
             if key not in final_results:
                 final_results[key] = None
-        # print("Resultados Finais:", final_results)
+        print("Resultados Finais:", final_results)
                 
         return final_results

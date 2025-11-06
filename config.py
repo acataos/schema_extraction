@@ -3,7 +3,7 @@ import torch
 # --- Model Settings ---
 LLM_MODEL_NAME = "gpt-5-mini"
 # O Embedding Model só será usado para regras semânticas (fallback)
-EMBEDDING_MODEL_NAME = 'paraphrase-multilingual-MiniLM-L12-v2'
+EMBEDDING_MODEL_PATH = 'sentence_transformer'
 
 # --- Geometric/Rule Settings ---
 # Quão perto (em pixels) duas caixas de texto precisam estar para
@@ -16,7 +16,7 @@ ROW_TOLERANCE = 5
 
  # --- Snippet Retrieval Settings ---
 SNIPPET_K_KEYWORDS = 2
-SNIPPET_K_SEMANTIC = 2
+SNIPPET_K_SEMANTIC = 0
 
 # --- Global Device Setting ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
