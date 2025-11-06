@@ -12,7 +12,7 @@ from document import Document
 from llm_service import find_values_from_layout
 from text_utils import stopword_filter, calculate_stopwords, normalize_text
 
-JACCARD_THRESHOLD = 0.95
+JACCARD_THRESHOLD = 0.6
 FULL_SCHEMAS = dict() # armazena schemas completos para análises futuras
 
 # Carregamos os modelos globalmente
@@ -28,7 +28,7 @@ except Exception as e:
 
 class Extractor:
     def __init__(self):
-        print("Inicializando Extractor...")
+        # print("Inicializando Extractor...")
         
         try:
             self.client = OpenAI()
@@ -40,7 +40,7 @@ class Extractor:
         if not self.embedding_model:
             print("AVISO: Extractor inicializado sem modelo de embedding.")
 
-        print("Extrator pronto.")
+        # print("Extrator pronto.")
 
 
     def _parse_schema(self, extraction_schema: dict) -> (Dict[str, List[str]], Dict[str, List[str]], Dict[str, str]):
@@ -50,7 +50,7 @@ class Extractor:
         2. global_cat_to_keys_map: {cat_norm -> [key1, key2]} (para ambiguidade)
         3. pattern_map: {key -> pattern_type} (ex: {"data_nasc": "date"})
         """
-        print("  Analisando schema em busca de campos Categóricos e de Padrão...")
+        # print("  Analisando schema em busca de campos Categóricos e de Padrão...")
         category_map = {}
         global_cat_to_keys_map = defaultdict(list)
         pattern_map = {} # <-- NOSSO NOVO MAPA
@@ -66,6 +66,14 @@ class Extractor:
         PATTERN_KEYWORDS = {
             "cpf": "cpf",
             "cnpj": "cnpj",
+            "cnh": "cnh",
+            "habilitacao": "cnh",
+            "cns": "cns",
+            "pis": "pis",
+            "identidade": "rg",
+            "rg": "rg",
+            "renavam": "renavam",
+            "titulo_eleitoral": "titulo_eleitoral",
             "telefone": "phone",
             "celular": "phone",
             "data": "date",
@@ -73,10 +81,12 @@ class Extractor:
             "dinheiro": "money",
             "quantia": "money",
             "saldo": "money",
-            "quantidade": "quantity",
+            # "quantidade": "quantity",
+            "endereco": "cep",
+            "logradouro": "cep",
             "contrato": "id",
             "numero": "id",
-            "codigo": "id"
+            "codigo": "id",
         }
 
         for key, description in extraction_schema.items():
@@ -93,7 +103,7 @@ class Extractor:
                 ]
                 
                 if categories:
-                    print(f"    - Chave categórica encontrada: '{key}' -> {categories}")
+                    # print(f"    - Chave categórica encontrada: '{key}' -> {categories}")
                     category_map[key] = categories
                     for cat in categories:
                         norm_cat = normalize_text(cat)
@@ -105,7 +115,7 @@ class Extractor:
             if key not in category_map:
                 for keyword, pattern_type in PATTERN_KEYWORDS.items():
                     if keyword in norm_desc or keyword in normalize_text(key):
-                        print(f"    - Chave de padrão encontrada: '{key}' -> tipo '{pattern_type}'")
+                        # print(f"    - Chave de padrão encontrada: '{key}' -> tipo '{pattern_type}'")
                         pattern_map[key] = pattern_type
                         break # Pára no primeiro padrão encontrado
         
@@ -126,7 +136,7 @@ class Extractor:
         Pipeline: Fast Path Categórico Seguro, seguido por
         Retrieval, Grouping e Extração LLM como fallback.
         """
-        print(f"\n--- Processando Label: {label} ---")
+        # print(f"\n--- Processando Label: {label} ---")
         start_time = time.time()
         
         # Mantém o cache de schema global
@@ -155,7 +165,7 @@ class Extractor:
         keys_for_llm = [] # Chaves que falharam no fast-path
 
         # --- PASSO 2: FAST PATH CATEGÓRICO (COM LÓGICA DE SEGURANÇA) ---
-        print("  Iniciando Passo 2: Fast Path Categórico Seguro...")
+        # print("  Iniciando Passo 2: Fast Path Categórico Seguro...")
         for key, description in extraction_schema.items():
             if key in category_map:
                 categories = category_map[key]
@@ -172,17 +182,19 @@ class Extractor:
                     if len(keys_sharing_this_category) == 1 and keys_sharing_this_category[0] == key:
                         # SUCESSO! É inequívoco.
                         final_results[key] = found_value
-                        print(f"    [FAST PATH HIT] Chave '{key}' resolvida localmente (Inequívoca): '{found_value}'")
+                        # print(f"    [FAST PATH HIT] Chave '{key}' resolvida localmente (Inequívoca): '{found_value}'")
                         continue # Pula para a próxima chave
                     else:
-                        print(f"    [FAST PATH FAIL] Chave '{key}' ambígua. Categoria '{found_value}' é compartilhada por {keys_sharing_this_category}.")
+                        pass
+                        # print(f"    [FAST PATH FAIL] Chave '{key}' ambígua. Categoria '{found_value}' é compartilhada por {keys_sharing_this_category}.")
                 
                 elif len(found_values_set) > 1:
-                    print(f"    [FAST PATH FAIL] Chave '{key}' ambígua. Múltiplos valores encontrados: {found_values_set}")
+                    pass
+                    # print(f"    [FAST PATH FAIL] Chave '{key}' ambígua. Múltiplos valores encontrados: {found_values_set}")
                 # achou nada => nao tem
                 else:
                     final_results[key] = None
-                    print(f"    [FAST PATH FAIL] Chave '{key}' não encontrada. Assumimos que seu valor é null.")
+                    # print(f"    [FAST PATH FAIL] Chave '{key}' não encontrada. Assumimos que seu valor é null.")
                     continue
 
             # Se qualquer falha ocorrer, ou se não for categórica,
@@ -192,7 +204,7 @@ class Extractor:
         # Se não houver chaves restantes, podemos pular tudo
         if not keys_for_llm:
             end_time = time.time()
-            print(f"--- Processamento Concluído (APENAS FAST PATH) em {end_time - start_time:.2f} segundos ---")
+            # print(f"--- Processamento Concluído (APENAS FAST PATH) em {end_time - start_time:.2f} segundos ---")
             # Garante que todas as chaves solicitadas estejam presentes
             for key in extraction_schema:
                 if key not in final_results: final_results[key] = None
@@ -200,7 +212,7 @@ class Extractor:
 
 
         # --- PASSO 3: RECUPERAÇÃO (RETRIEVAL) - Apenas para chaves do LLM ---
-        print(f"  Iniciando Passo 3: Recuperação de Âncoras (para {len(keys_for_llm)} chaves)...")
+        # print(f"  Iniciando Passo 3: Recuperação de Âncoras (para {len(keys_for_llm)} chaves)...")
         retrieved_anchors_by_key: Dict[str, set[Line]] = {}
         
         for key in keys_for_llm:
@@ -237,7 +249,7 @@ class Extractor:
             retrieved_anchors_by_key[key] = context_set
 
         # --- PASSO 4: INFLAR O CONTEXTO E AGRUPAR ---
-        print("  Iniciando Passo 4: Inflar Contexto e Agrupar Chaves...")
+        # print("  Iniciando Passo 4: Inflar Contexto e Agrupar Chaves...")
         retrieved_snippets_by_key: Dict[str, frozenset[int]] = {} # Armazena line INDICES
         
         for key, anchor_lines in retrieved_anchors_by_key.items():
@@ -253,7 +265,7 @@ class Extractor:
             retrieved_snippets_by_key[key] = frozenset(inflated_snippets)
 
         # --- PASSO 5: AGRUPAMENTO (BATCHING) ---
-        print("  Iniciando Passo 5: Agrupamento (Jaccard)...")
+        # print("  Iniciando Passo 5: Agrupamento (Jaccard)...")
         clusters = []
         keys_without_snippets = set()
         for key in keys_for_llm: # Itera apenas nas chaves do LLM
@@ -290,11 +302,8 @@ class Extractor:
         final_groups: list[Set[str]] = [c['keys'] for c in clusters]
         if keys_without_snippets:
             final_groups.append(keys_without_snippets)
-        print(f"  -> Grupos de extração formados: {[list(g) for g in final_groups]}")
+        # print(f"  -> Grupos de extração formados: {[list(g) for g in final_groups]}")
 
-        # --- PASSO 6: EXTRAÇÃO (LLM EM PARALELO) ---
-        print("  Iniciando Passo 6: Extração via LLM (Paralelizada)...")
-        
         MAX_CONCURRENT_CALLS = 5 
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CALLS) as executor:
             future_to_group = {}
@@ -312,7 +321,7 @@ class Extractor:
                 context = doc.serialize_snippets_for_llm(all_snippets_indices)
                 
                 schema_group = {key: extraction_schema[key] for key in key_group_set}
-                print(f"  Submetendo chamada para o GRUPO: {list(key_group_set)}...")
+                # print(f"  Submetendo chamada para o GRUPO: {list(key_group_set)}...")
                 
                 excluded_schema_group = dict([(k,v) for k,v in FULL_SCHEMAS[label].items() if k not in key_group_set])
                 future = executor.submit(
@@ -329,19 +338,19 @@ class Extractor:
                 try:
                     llm_values = future.result()
                     final_results.update(llm_values)
-                    print(f"  -> Resultado recebido para o GRUPO: {list(key_group_set)}")
+                    # print(f"  -> Resultado recebido para o GRUPO: {list(key_group_set)}")
                 except Exception as e:
-                    print(f"ERRO: A thread para o grupo {list(key_group_set)} falhou: {e}")
+                    # print(f"ERRO: A thread para o grupo {list(key_group_set)} falhou: {e}")
                     for key in key_group_set:
                         final_results[key] = None
 
         end_time = time.time()
-        print(f"--- Processamento Concluído em {end_time - start_time:.2f} segundos ---")
+        # print(f"--- Processamento Concluído em {end_time - start_time:.2f} segundos ---")
         
         # Garante que todas as chaves solicitadas tenham pelo menos um 'None'
         for key in extraction_schema:
             if key not in final_results:
                 final_results[key] = None
-        print("Resultados Finais:", final_results)
+        # print("Resultados Finais:", final_results)
                 
         return final_results

@@ -8,6 +8,8 @@ from thefuzz import fuzz
 import torch
 from text_utils import fuzzy_match, normalize_text
 import re
+from validate_docbr import CPF, CNH, CNPJ, CNS, PIS, TituloEleitoral, RENAVAM
+
 
 @dataclass(frozen=True, order=True)
 class Line:
@@ -155,6 +157,34 @@ class Document:
         self.tables_dict = dict()  # Mapeia table_id para listas de índices de linhas
         self.column_order_dict = dict()
 
+        self.PATTERNS = {
+            "cpf": r"\b(\d{11}|\d{3}\.\d{3}\.\d{3}-\d{2})\b",
+            "cnpj": r"\b(\d{14}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})\b",
+            "money": r"(?:R\$\s*)?\b\d{1,3}(?:\.\d{3})*,\d{2}\b",
+            "phone": r"\b(\(\d{2}\)\s*\d{4,5}-\d{4}|\(\d{2}\)\s*\d{8,9}|(\d{2}\s*)?\d{4,5}-\d{4}|\d{8,11})\b",
+            "date": r"\b\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}\b",
+            "cep": r"\b(\d{8}|\d{5}-\d{3})\b",
+            "cnh": r"\b\d{11}\b",
+            "pis": r"\b(\d{11}|\d\.\d{3}\.\d{3}\.\d{2}-\d)\b",
+            "titulo_eleitoral": r"\b\d{12}\b",
+            "cns": r"\b\d{15}\b",
+            "rg": r"\b(\d{1,2}\.\d{3}\.\d{3}-[\dX]|\d{7,9})\b",
+            "renavam": r"\b(\d{9}|\d{11})\b",
+            "other_id": r"\b(\d{5,}|\d+[./-]\d+(?:[./-]\d+)*)\b",
+        }
+
+        self.VALIDATORS = {
+            "cpf": self._validate_cpf,
+            "cnpj": self._validate_cnpj,
+            "cnh": self._validate_cnh,
+            "cns": self._validate_cns,
+            "renavam": self._validate_renavam,
+            "titulo_eleitoral": self._validate_titulo_eleitoral,
+            "pis": self._validate_pis,
+            "cep": self._validate_cep,
+            "other_id": self._validate_other_id,
+        }
+
     def _parse_spans(self, page_dict: dict) -> List[TextBox]:
         """Converte o 'dict' do Fitz em uma lista plana de objetos TextBox."""
         boxes = []
@@ -253,65 +283,48 @@ class Document:
 
     def _validate_cpf(self, cpf: str) -> bool:
         """Valida um CPF (limpo ou formatado) pelo dígito verificador."""
-        cpf_limpo = self._clean_doc_id(cpf)
-        
-        # 1. Verifica o formato
-        if len(cpf_limpo) != 11 or not cpf_limpo.isdigit():
-            return False
-        # 2. Verifica se todos os dígitos são iguais (ex: 111.111...)
-        if len(set(cpf_limpo)) == 1:
-            return False
-            
-        try:
-            # 3. Valida o primeiro dígito
-            soma = sum(int(cpf_limpo[i]) * (10 - i) for i in range(9))
-            dv1 = (soma * 10) % 11
-            if dv1 == 10: dv1 = 0
-            if dv1 != int(cpf_limpo[9]):
-                return False
-                
-            # 4. Valida o segundo dígito
-            soma = sum(int(cpf_limpo[i]) * (11 - i) for i in range(10))
-            dv2 = (soma * 10) % 11
-            if dv2 == 10: dv2 = 0
-            if dv2 != int(cpf_limpo[10]):
-                return False
-        except ValueError:
-            return False # Deve ser dígito
-            
-        return True # CPF é válido
+        return CPF().validate(cpf)
 
     def _validate_cnpj(self, cnpj: str) -> bool:
         """Valida um CNPJ (limpo ou formatado) pelo dígito verificador."""
-        cnpj_limpo = self._clean_doc_id(cnpj)
-        
-        # 1. Verifica o formato
-        if len(cnpj_limpo) != 14 or not cnpj_limpo.isdigit():
-            return False
-        # 2. Verifica se todos os dígitos são iguais
-        if len(set(cnpj_limpo)) == 1:
-            return False
-            
+        return CNPJ().validate(cnpj)
+
+    def _validate_cnh(self, cnh: str) -> bool:
+        """Valida um CNH (limpo ou formatado) pelo dígito verificador."""
+        return CNH().validate(cnh)
+
+    def _validate_cns(self, cns: str) -> bool:
+        """Valida um CNS (limpo ou formatado) pelo dígito verificador."""
+        return CNS().validate(cns)
+
+    def _validate_renavam(self, renavam: str) -> bool:
+        """Valida um RENAVAM (limpo ou formatado) pelo dígito verificador."""
+        return RENAVAM().validate(renavam)
+
+    def _validate_pis(self, pis: str) -> bool:
+        """Valida um RENAVAM (limpo ou formatado) pelo dígito verificador."""
+        return PIS().validate(pis)
+
+    def _validate_titulo_eleitoral(self, titulo_eleitoral: str) -> bool:
+        """Valida um Titulo Eleitoral (limpo ou formatado) pelo dígito verificador."""
+        return TituloEleitoral().validate(titulo_eleitoral)
+
+    def _validate_cep(self, cep: str):
         try:
-            # 3. Valida o primeiro dígito
-            pesos = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
-            soma = sum(int(cnpj_limpo[i]) * pesos[i] for i in range(12))
-            dv1 = 11 - (soma % 11)
-            if dv1 >= 10: dv1 = 0
-            if dv1 != int(cnpj_limpo[12]):
-                return False
-                
-            # 4. Valida o segundo dígito
-            pesos = [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
-            soma = sum(int(cnpj_limpo[i]) * pesos[i] for i in range(13))
-            dv2 = 11 - (soma % 11)
-            if dv2 >= 10: dv2 = 0
-            if dv2 != int(cnpj_limpo[13]):
-                return False
-        except ValueError:
+            address = brazilcep.get_address_from_cep(cep, timeout=0.03)
+            return True
+        except:
             return False
-            
-        return True # CNPJ é válido
+
+    def _validate_other_id(self, id: str):
+        # first assert that its not a match for any other pattern
+        for pattern in (pattern_type,pattern) in self.PATTERNS.items():
+            if pattern_type == "other_id":
+                continue
+            if re.fullmatch(pattern, id) and self.VALIDATORS[pattern_type](self._clean_doc_id(id)):
+                return False
+        return True
+
 
     def serialize_layout_for_llm(self) -> str:
         """
@@ -929,35 +942,14 @@ class Document:
         específico, com validação para CPF/CNPJ.
         """
         
-        # 1. Dicionário de RegEx atualizado
-        PATTERNS = {
-            # 1) CPF: (11 dígitos limpos) OU (formato XXX.XXX.XXX-XX)
-            "cpf": r"\b(\d{11}|\d{3}\.\d{3}\.\d{3}-\d{2})\b",
-            # 1) CNPJ: (14 dígitos limpos) OU (formato XX.XXX.XXX/XXXX-XX)
-            "cnpj": r"\b(\d{14}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})\b",
-            # 2) Money: (Opcional R$) + (dígitos e pontos) + (vírgula e 2 dígitos)
-            "money": r"(?:R\$\s*)?\b\d{1,3}(?:\.\d{3})*,\d{2}\b",
-            # 3) Phone: (Vários formatos OU 8-11 dígitos limpos)
-            "phone": r"\b(\(\d{2}\)\s*\d{4,5}-\d{4}|\(\d{2}\)\s*\d{8,9}|(\d{2}\s*)?\d{4,5}-\d{4}|\d{8,11})\b",
-            # 4) Quantity: (Uma sequência de dígitos)
-            # "quantity": r"\b\d+\b",
-            # 5) Generic id: (5 ou mais dígitos, ou formatos com separadores)
-            "id": r"\b(\d+[./-]\d+(?:[./-]\d+)*|\d+)\b",
-            # 6) Date: (DD/MM/YYYY ou DD-MM-YYYY)
-            "date": r"\b\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}\b",
-        }
         
         # 2. Mapeia tipos para suas funções de validação
-        VALIDATORS = {
-            "cpf": self._validate_cpf,
-            "cnpj": self._validate_cnpj
-        }
 
-        pattern = PATTERNS.get(pattern_type)
+        pattern = self.PATTERNS.get(pattern_type)
         if not pattern:
             return set()
 
-        validator = VALIDATORS.get(pattern_type)
+        validator = self.VALIDATORS.get(pattern_type)
         found_lines = set()
         
         for line in self.lines:
