@@ -158,8 +158,11 @@ class Extractor:
                 
                 elif len(found_values_set) > 1:
                     print(f"    [FAST PATH FAIL] Chave '{key}' ambígua. Múltiplos valores encontrados: {found_values_set}")
+                # achou nada => nao tem
                 else:
-                    print(f"    [FAST PATH FAIL] Chave '{key}' não encontrada. Enviando para LLM.")
+                    final_results[key] = None
+                    print(f"    [FAST PATH FAIL] Chave '{key}' não encontrada. Assumimos que seu valor é null.")
+                    continue
 
             # Se qualquer falha ocorrer, ou se não for categórica,
             # a chave é adicionada para o pipeline do LLM.
@@ -273,8 +276,8 @@ class Extractor:
                     continue
                 
                 # Converte os índices de volta para objetos Line e serializa
-                lines_sorted = sorted([doc.lines[i] for i in all_snippets_indices], key=lambda l: l.idx)
-                context = "\n---\n".join([line.serialize_layout() for line in lines_sorted])
+                # lines_sorted = sorted([doc.lines[i] for i in all_snippets_indices], key=lambda l: l.idx)
+                context = doc.serialize_snippets_for_llm(all_snippets_indices)
                 
                 schema_group = {key: extraction_schema[key] for key in key_group_set}
                 print(f"  Submetendo chamada para o GRUPO: {list(key_group_set)}...")

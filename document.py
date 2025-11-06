@@ -35,15 +35,15 @@ class Line:
         return len(self.boxes)
 
     def serialize_layout(self) -> str:
-        s = f"[TABLE {self.table_id} ROW] " if self.table_id is not None else ""
-        for i,b in enumerate(self.boxes):
-            s += f"{b.text} "
-            if b.col_index is not None:
-                s += f"{{col: {b.col_index}}} "
-            if i < len(self.boxes)-1:
-                s+= "| "
-
-        return s
+        """
+        Serializa uma ÚNICA linha que NÃO é de tabela, 
+        separando os spans (caixas) com um delimitador.
+        """
+        # Filtra spans vazios, se houver
+        texts = [b.text for b in self.boxes if b.text.strip()]
+        
+        # ex: "Pesquisar por: | CLIENTE | Tipo: | CPF"
+        return " | ".join(texts)
 
 
 @dataclass(frozen=True, order=True)
@@ -152,7 +152,8 @@ class Document:
         self.page_width = fitz_page_dict.get("width", None)
         self.max_font_size = max(b.font_size for b in self.boxes)
         self.min_font_size = min(b.font_size for b in self.boxes)
-        self.tables_dict = {}  # Mapeia table_id para listas de índices de linhas
+        self.tables_dict = dict()  # Mapeia table_id para listas de índices de linhas
+        self.column_order_dict = dict()
     def _parse_spans(self, page_dict: dict) -> List[TextBox]:
         """Converte o 'dict' do Fitz em uma lista plana de objetos TextBox."""
         boxes = []
@@ -273,6 +274,110 @@ class Document:
 
         return s
 
+    def serialize_snippets_for_llm(self, line_indices: Set[int] = None) -> str:
+        """
+        Serializa um conjunto de linhas de forma inteligente para o LLM,
+        agrupando linhas de tabela contíguas em tabelas Markdown
+        que lidam corretamente com células vazias.
+        
+        Args:
+            line_indices: Um conjunto (Set) de índices de linhas (l.idx) 
+                          que o Extractor julgou relevantes.
+                          
+        Returns:
+            Uma string de contexto formatada.
+        """
+        if line_indices is None:
+            line_indices = set(range(len(self.lines)))
+        
+        # 1. Obtém os objetos Line a partir dos índices e os ordena
+        lines_to_serialize = sorted(
+            [self.lines[i] for i in line_indices if i < len(self.lines)], 
+            key=lambda l: l.idx
+        )
+        
+        context_parts = []
+        
+        # 2. Itera sobre as linhas, agrupando por 'table_id'
+        for table_id, line_group_iter in itertools.groupby(lines_to_serialize, key=lambda line: line.table_id):
+            
+            group_lines = list(line_group_iter)
+            
+            if table_id is None:
+                # --- Bloco de Linhas Normais ---
+                # Serializa cada linha individualmente usando o novo
+                # Line.serialize_layout()
+                for line in group_lines:
+                    context_parts.append(line.serialize_layout())
+            else:
+                # --- Bloco de Tabela (LÓGICA DE VALOR AUSENTE) ---
+                # Serializa o grupo como uma tabela Markdown
+                
+                # 1. Encontra o número MÁXIMO de colunas nesta tabela
+                max_cols = 0
+                for line in group_lines:
+                    if not line.boxes: continue
+                    # Pega o maior col_index encontrado
+                    line_max = max(b.col_index for b in line.boxes if b.col_index is not None)
+                    if line_max is not None:
+                        max_cols = max(max_cols, line_max + 1)
+                
+                # Fallback se nenhum col_index foi atribuído
+                if max_cols == 0:
+                    max_cols = max(len(line.boxes) for line in group_lines)
+                
+                # Se não for uma tabela real (ex: 1 coluna), trate como linhas normais
+                if max_cols <= 1:
+                    for line in group_lines:
+                        context_parts.append(line.serialize_layout())
+                    continue
+
+                # 2. Constrói a tabela Markdown
+                table_str = ""
+                for i, line in enumerate(group_lines):
+                    start_str = "| "
+                    end_str = " |\n"
+                    
+                    # --- ESTA É A LÓGICA-CHAVE ---
+                    # Cria um "grid" vazio para todas as colunas
+                    cells = [""] * max_cols
+
+                    cell_ind = None
+                    for j,box in enumerate(line.boxes):
+                        if box.col_index is not None:
+                            cell_ind = self.column_order_dict[table_id].index(box.col_index) 
+                            cells[cell_ind] += box.text + " "
+                        elif j==0 and box.col_index is None:
+                            start_str = f"{box.text} |"
+                        elif j==len(line.boxes)-1 and box.col_index is None:
+                            end_str = f"| {box.text}\n"
+                        else:
+                            if cell_ind is None:
+                                start_str = f"{start_str[:-1]}; {box.text} |" 
+                                continue
+                            cells[cell_ind] += f"[{box.text}] "
+                    
+                    # Limpa espaços extras
+                    cells_cleaned = [c.strip() for c in cells]
+                    
+                    # Junta o grid. Células vazias se tornarão '| |'
+                    table_str += start_str + " | ".join(cells_cleaned) + end_str
+                    # ------------------------------------
+                    
+                    # Adiciona a linha de separador do Markdown
+                    if i == 0: 
+                        table_str += "| " + " | ".join(["---"] * max_cols) + " |\n"
+                
+                context_parts.append(table_str)
+
+        start_text = ""
+        end_text = ""
+        if 0 in line_indices:
+            start_text = "[DOCUMENT START]\n"
+        if len(self.lines)-1 in line_indices:
+            end_text = "\n[DOCUMENT END]"
+        # Junta todos os blocos (linhas normais e tabelas)
+        return start_text+"\n---\n".join(context_parts)+end_text
 
     # --- Métodos de Extração (O Motor de Regras) ---
 
@@ -381,29 +486,41 @@ class Document:
             boxes = line.boxes
             if len(line) < 2:
                 continue
+
             below_boxes = [self.find_close_box(box, "below") for box in boxes]
-            line_indices = [below_box.line_idx if below_box is not None else -1 for below_box in below_boxes]
-            first_line_below = min([id for id in line_indices if id != -1], default=-1)
-            if line_indices.count(first_line_below)<2 or first_line_below==-1:
+            line_indices = [below_box.line_idx for below_box in below_boxes if below_box is not None]
+
+            if not line_indices: continue
+
+            first_line_below = min(line_indices)
+            if line_indices.count(first_line_below)<2:
                 continue
+            below_line_value = self.lines[first_line_below]
             if line.table_id is None:
-                object.__setattr__(line, 'table_id', len(self.tables_dict))
-                object.__setattr__(self.lines[first_line_below], 'table_id', len(self.tables_dict))
-                self.tables_dict[len(self.tables_dict)] = [line.idx, first_line_below]
+                new_table_id = len(self.tables_dict)
+                object.__setattr__(line, 'table_id', new_table_id)
+                object.__setattr__(below_line_value, 'table_id', new_table_id)
+                self.tables_dict[new_table_id] = {line, below_line_value}
             else: 
-                object.__setattr__(self.lines[first_line_below], 'table_id', line.table_id)
-                self.tables_dict[line.table_id].append(first_line_below)
+                object.__setattr__(below_line_value, 'table_id', line.table_id)
+                self.tables_dict[line.table_id].add(below_line_value)
             col_index = max([box.col_index for box in boxes if box.col_index is not None], default=-1) + 1
             for box in boxes:
                 below_box = self.find_close_box(box, "below")
                 if below_box is not None and below_box in self.lines[first_line_below].boxes:
                     if box.col_index is not None:
+                        curr_col_index = box.col_index
                         object.__setattr__(box, 'col_index', box.col_index)
                         object.__setattr__(below_box, 'col_index', box.col_index)
                     else:
+                        curr_col_index = col_index
                         object.__setattr__(below_box, 'col_index', col_index)
                         object.__setattr__(box, 'col_index', col_index)
                         col_index += 1
+                        # update col index ordering
+                        boxes_with_col_index = [b for b in boxes if b.col_index is not None]
+                        index_to_insert = sorted(boxes_with_col_index, key=lambda b: b.x0).index(box)
+                        self.column_order_dict.setdefault(line.table_id, []).insert(index_to_insert, curr_col_index)
 
 
     def embed_spans(self, embedding_model: SentenceTransformer):
@@ -519,7 +636,7 @@ class Document:
                 # Encontra o objeto Table e serializa ele
                 table_lines = self.tables_dict.get(line.table_id, [])
                 # Retorna o texto de todas as linhas da tabela
-                return {l for l in table_lines}
+                return {l.idx for l in table_lines}
             except Exception as e:
                 print(f"AVISO: Falha ao buscar tabela para linha {line.idx}. {e}")
                 # Falha: continue para a lógica de janela,
