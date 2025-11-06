@@ -42,35 +42,50 @@ class Extractor:
 
         print("Extrator pronto.")
 
-    def _parse_schema(self, extraction_schema: dict) -> (Dict[str, List[str]], Dict[str, List[str]]):
+
+    def _parse_schema(self, extraction_schema: dict) -> (Dict[str, List[str]], Dict[str, List[str]], Dict[str, str]):
         """
-        Analisa o schema UMA VEZ para criar dois mapas:
+        Analisa o schema UMA VEZ para criar três mapas:
         1. category_map: {key -> [cat1, cat2]}
-        2. global_cat_to_keys_map: {cat_norm -> [key1, key2]} (para verificação de ambiguidade)
+        2. global_cat_to_keys_map: {cat_norm -> [key1, key2]} (para ambiguidade)
+        3. pattern_map: {key -> pattern_type} (ex: {"data_nasc": "date"})
         """
-        print("  Analisando schema em busca de campos categóricos...")
+        print("  Analisando schema em busca de campos Categóricos e de Padrão...")
         category_map = {}
         global_cat_to_keys_map = defaultdict(list)
+        pattern_map = {} # <-- NOSSO NOVO MAPA
         
-        # --- MUDANÇA PRINCIPAL AQUI ---
-        # 1. GATILHO: Procura por "pode ser", "pode ser por", "pode ser feita por", "é efetuado por"
-        #    (da mais longa para a mais curta, para evitar matches parciais)
-        # 2. CAPTURA: Captura tudo "não-gulosamente" (.*?)
-        # 3. PARADA: Para no primeiro PONTO FINAL (.) ou no FIM DA STRING ($).
-        pattern = re.compile(
+        # Padrão RegEx para Categorias (ex: "pode ser A, B ou C")
+        cat_pattern = re.compile(
             r"(?:pode ser (?:feita )?por|é efetuado por|pode ser por|pode ser)\s+(.*?)(?:\.|$)", 
             re.IGNORECASE
         )
-        # -------------------------------
+        
+        # Mapeamento de palavras-chave para tipos de padrão
+        # (A ordem importa: "cnpj" deve vir antes de "id")
+        PATTERN_KEYWORDS = {
+            "cpf": "cpf",
+            "cnpj": "cnpj",
+            "telefone": "phone",
+            "celular": "phone",
+            "data": "date",
+            "valor": "money",
+            "dinheiro": "money",
+            "quantia": "money",
+            "saldo": "money",
+            "quantidade": "quantity",
+            "contrato": "id",
+            "numero": "id",
+            "codigo": "id"
+        }
 
         for key, description in extraction_schema.items():
-            match = pattern.search(description)
-            if match:
-                # Captura o Grupo 1, que é a lista (ex: "vencido, pago ou pendente")
-                category_string = match.group(1)
-                
-                # A lógica de split (que já estava correta e alinhada com sua ideia)
-                # divide por vírgula OU pela palavra "ou" cercada de espaços.
+            norm_desc = normalize_text(description)
+            
+            # 1. Tenta encontrar Categorias
+            cat_match = cat_pattern.search(description)
+            if cat_match:
+                category_string = cat_match.group(1)
                 categories = [
                     cat.strip() for cat in 
                     re.split(r',|\s+ou\s+', category_string) 
@@ -80,15 +95,21 @@ class Extractor:
                 if categories:
                     print(f"    - Chave categórica encontrada: '{key}' -> {categories}")
                     category_map[key] = categories
-                    
-                    # Constrói o mapa reverso
                     for cat in categories:
-                        # Usamos normalize_text (do seu text_utils) aqui
-                        norm_cat = normalize_text(cat) 
+                        norm_cat = normalize_text(cat)
                         if key not in global_cat_to_keys_map[norm_cat]:
                             global_cat_to_keys_map[norm_cat].append(key)
+                
+            # 2. Tenta encontrar Padrões (RegEx)
+            # (Não executa se já for categórico, para evitar confusão)
+            if key not in category_map:
+                for keyword, pattern_type in PATTERN_KEYWORDS.items():
+                    if keyword in norm_desc or keyword in normalize_text(key):
+                        print(f"    - Chave de padrão encontrada: '{key}' -> tipo '{pattern_type}'")
+                        pattern_map[key] = pattern_type
+                        break # Pára no primeiro padrão encontrado
         
-        return category_map, dict(global_cat_to_keys_map)
+        return category_map, dict(global_cat_to_keys_map), pattern_map
 
     def _calculate_jaccard(self, set1: frozenset[str], set2: frozenset[str]) -> float:
         """Calcula a Similaridade Jaccard entre dois conjuntos de snippets."""
@@ -128,7 +149,7 @@ class Extractor:
         # (Substitui sua lógica de stopwords)
         descs = list(FULL_SCHEMAS[label].values())
         stopwords = calculate_stopwords(descs, threshold=0.5) # Sua função
-        category_map, global_cat_to_keys_map = self._parse_schema(FULL_SCHEMAS[label])
+        category_map, global_cat_to_keys_map, pattern_map = self._parse_schema(FULL_SCHEMAS[label])
 
         final_results = {}
         keys_for_llm = [] # Chaves que falharam no fast-path
@@ -192,16 +213,27 @@ class Extractor:
             # 3b. Positional Retrieval (retorna set[Line])
             pos_lines = doc.get_positional_matching_lines(description)
             
-            # 3c. Categorical Retrieval (NOVO)
+            # 3c. Categorical Retrieval (retorna set[Line])
             cat_lines = doc.get_categorical_snippets(category_map.get(key, []))
+
+            # 3d. Pattern Retrieval (retorna set[Line])
+            pattern_type = pattern_map.get(key)
+            pat_lines = set()
+            if pattern_type:
+                pat_lines = doc.get_pattern_snippets(pattern_type)
+            # print()
+            # print("Chave:", key)
+            # print("  Linhas por Padrão:", "\n".join([l.text for l in pat_lines]))
+            # print()
+            # breakpoint()
             
             # 3d. Semantic Retrieval (retorna set[Line])
             query = f"{key}: {clean_description}"
-            k = max(0, config.SNIPPET_K_SEMANTIC - len(kw_lines) - len(pos_lines) - len(cat_lines))
+            k = max(0, config.SNIPPET_K_SEMANTIC - len(kw_lines) - len(pos_lines) - len(cat_lines) -len(pat_lines))
             sem_lines = doc.get_semantic_matching_lines(self.embedding_model, query, k=k)
             
             # 3e. Combina os objetos Line
-            context_set = set(kw_lines).union(set(sem_lines)).union(set(pos_lines)).union(cat_lines)
+            context_set = set(kw_lines).union(set(sem_lines)).union(set(pos_lines)).union(cat_lines).union(pat_lines)
             retrieved_anchors_by_key[key] = context_set
 
         # --- PASSO 4: INFLAR O CONTEXTO E AGRUPAR ---
@@ -282,11 +314,13 @@ class Extractor:
                 schema_group = {key: extraction_schema[key] for key in key_group_set}
                 print(f"  Submetendo chamada para o GRUPO: {list(key_group_set)}...")
                 
+                excluded_schema_group = dict([(k,v) for k,v in FULL_SCHEMAS[label].items() if k not in key_group_set])
                 future = executor.submit(
                     find_values_from_layout,
                     self.client, 
                     context, 
-                    schema_group
+                    schema_group,
+                    excluded_schema_group,
                 )
                 future_to_group[future] = key_group_set
 

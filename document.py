@@ -154,6 +154,7 @@ class Document:
         self.min_font_size = min(b.font_size for b in self.boxes)
         self.tables_dict = dict()  # Mapeia table_id para listas de índices de linhas
         self.column_order_dict = dict()
+
     def _parse_spans(self, page_dict: dict) -> List[TextBox]:
         """Converte o 'dict' do Fitz em uma lista plana de objetos TextBox."""
         boxes = []
@@ -246,6 +247,71 @@ class Document:
                 line_boxes.insert(idx_to_insert, boxes_to_add[i])
                 del box
 
+    def _clean_doc_id(self, doc_id: str) -> str:
+        """Remove toda a pontuação de uma string de documento."""
+        return re.sub(r'[.\-/]', '', doc_id)
+
+    def _validate_cpf(self, cpf: str) -> bool:
+        """Valida um CPF (limpo ou formatado) pelo dígito verificador."""
+        cpf_limpo = self._clean_doc_id(cpf)
+        
+        # 1. Verifica o formato
+        if len(cpf_limpo) != 11 or not cpf_limpo.isdigit():
+            return False
+        # 2. Verifica se todos os dígitos são iguais (ex: 111.111...)
+        if len(set(cpf_limpo)) == 1:
+            return False
+            
+        try:
+            # 3. Valida o primeiro dígito
+            soma = sum(int(cpf_limpo[i]) * (10 - i) for i in range(9))
+            dv1 = (soma * 10) % 11
+            if dv1 == 10: dv1 = 0
+            if dv1 != int(cpf_limpo[9]):
+                return False
+                
+            # 4. Valida o segundo dígito
+            soma = sum(int(cpf_limpo[i]) * (11 - i) for i in range(10))
+            dv2 = (soma * 10) % 11
+            if dv2 == 10: dv2 = 0
+            if dv2 != int(cpf_limpo[10]):
+                return False
+        except ValueError:
+            return False # Deve ser dígito
+            
+        return True # CPF é válido
+
+    def _validate_cnpj(self, cnpj: str) -> bool:
+        """Valida um CNPJ (limpo ou formatado) pelo dígito verificador."""
+        cnpj_limpo = self._clean_doc_id(cnpj)
+        
+        # 1. Verifica o formato
+        if len(cnpj_limpo) != 14 or not cnpj_limpo.isdigit():
+            return False
+        # 2. Verifica se todos os dígitos são iguais
+        if len(set(cnpj_limpo)) == 1:
+            return False
+            
+        try:
+            # 3. Valida o primeiro dígito
+            pesos = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+            soma = sum(int(cnpj_limpo[i]) * pesos[i] for i in range(12))
+            dv1 = 11 - (soma % 11)
+            if dv1 >= 10: dv1 = 0
+            if dv1 != int(cnpj_limpo[12]):
+                return False
+                
+            # 4. Valida o segundo dígito
+            pesos = [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+            soma = sum(int(cnpj_limpo[i]) * pesos[i] for i in range(13))
+            dv2 = 11 - (soma % 11)
+            if dv2 >= 10: dv2 = 0
+            if dv2 != int(cnpj_limpo[13]):
+                return False
+        except ValueError:
+            return False
+            
+        return True # CNPJ é válido
 
     def serialize_layout_for_llm(self) -> str:
         """
@@ -853,5 +919,61 @@ class Document:
                     # Otimização: uma vez que encontramos uma categoria
                     # nesta linha, não precisamos verificar as outras.
                     break 
+        
+        return found_lines
+
+
+    def get_pattern_snippets(self, pattern_type: str) -> set[Line]:
+        """
+        Busca no documento por linhas que contenham um padrão (RegEx)
+        específico, com validação para CPF/CNPJ.
+        """
+        
+        # 1. Dicionário de RegEx atualizado
+        PATTERNS = {
+            # 1) CPF: (11 dígitos limpos) OU (formato XXX.XXX.XXX-XX)
+            "cpf": r"\b(\d{11}|\d{3}\.\d{3}\.\d{3}-\d{2})\b",
+            # 1) CNPJ: (14 dígitos limpos) OU (formato XX.XXX.XXX/XXXX-XX)
+            "cnpj": r"\b(\d{14}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})\b",
+            # 2) Money: (Opcional R$) + (dígitos e pontos) + (vírgula e 2 dígitos)
+            "money": r"(?:R\$\s*)?\b\d{1,3}(?:\.\d{3})*,\d{2}\b",
+            # 3) Phone: (Vários formatos OU 8-11 dígitos limpos)
+            "phone": r"\b(\(\d{2}\)\s*\d{4,5}-\d{4}|\(\d{2}\)\s*\d{8,9}|(\d{2}\s*)?\d{4,5}-\d{4}|\d{8,11})\b",
+            # 4) Quantity: (Uma sequência de dígitos)
+            # "quantity": r"\b\d+\b",
+            # 5) Generic id: (5 ou mais dígitos, ou formatos com separadores)
+            "id": r"\b(\d+[./-]\d+(?:[./-]\d+)*|\d+)\b",
+            # 6) Date: (DD/MM/YYYY ou DD-MM-YYYY)
+            "date": r"\b\d{1,2}[/\-.]\d{1,2}[/\-.]\d{2,4}\b",
+        }
+        
+        # 2. Mapeia tipos para suas funções de validação
+        VALIDATORS = {
+            "cpf": self._validate_cpf,
+            "cnpj": self._validate_cnpj
+        }
+
+        pattern = PATTERNS.get(pattern_type)
+        if not pattern:
+            return set()
+
+        validator = VALIDATORS.get(pattern_type)
+        found_lines = set()
+        
+        for line in self.lines:
+            # Encontra TODOS os candidatos na linha
+            for match in re.finditer(pattern, line.text):
+                candidate = match.group(0)
+                
+                # 3. Executa a validação se ela existir
+                if validator:
+                    if validator(candidate):
+                        # É um CPF/CNPJ válido!
+                        found_lines.add(line)
+                        break # Encontrou um válido, pode parar de procurar nesta linha
+                else:
+                    # É um padrão sem validador (money, phone, qty)
+                    found_lines.add(line)
+                    break # Encontrou um, pode parar de procurar nesta linha
         
         return found_lines

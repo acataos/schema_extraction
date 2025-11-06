@@ -3,7 +3,7 @@ from openai import OpenAI
 import config
 from typing import Dict
 
-def find_values_from_layout(client: OpenAI, context: str, schema_group: Dict[str, str]) -> Dict[str, any]:
+def find_values_from_layout(client: OpenAI, context: str, schema_group: Dict[str, str], excluded_schema_group: Dict[str, str]) -> Dict[str, any]:
     """
     Chama o LLM para extrair um GRUPO de valores, dado um contexto de layout.
     
@@ -15,6 +15,10 @@ def find_values_from_layout(client: OpenAI, context: str, schema_group: Dict[str
     for key, description in schema_group.items():
         schema_prompt += f"  - Chave: '{key}', Descrição: '{description}'\n"
 
+    excluded_schema_prompt = ""
+    for key, description in excluded_schema_group.items():
+        excluded_schema_prompt += f"  - Chave: '{key}', Descrição: '{description}'\n"
+
     # 2. Constrói os prompts do sistema e do usuário
     system_prompt = """
     Você é um assistente de extração de dados (em português).
@@ -25,6 +29,7 @@ def find_values_from_layout(client: OpenAI, context: str, schema_group: Dict[str
     -   Analise os "TRECHOS DE CONTEXTO" fornecidos.
     -   Para cada chave no "GRUPO DE CAMPOS PARA EXTRAIR", encontre o valor
         correspondente no contexto.
+    -   Verifique o "GRUPO DE CAMPOS EXCLUÍDOS" e NÃO extraia valores para essas chaves.
     -   Se um valor não for encontrado, retorne null para essa chave.
     -   Responda APENAS com um objeto JSON contendo os valores extraídos.
 
@@ -44,6 +49,9 @@ def find_values_from_layout(client: OpenAI, context: str, schema_group: Dict[str
     GRUPO DE CAMPOS PARA EXTRAIR:
     {schema_prompt}
     ---
+    GRUPO DE CAMPOS EXCLUÍDOS (não considerar estes campos):
+    {excluded_schema_prompt}
+    ---
     OBJETO JSON DE RESPOSTA (apenas valores):
     """
 
@@ -62,6 +70,14 @@ def find_values_from_layout(client: OpenAI, context: str, schema_group: Dict[str
             response_format={"type": "json_object"}
         )
         response_text = response.choices[0].message.content
+        # debug_str = f"""\n\n
+        #     Chamando LLM para extração de grupo de campos...
+        #     {human_prompt}
+        #     ----------------
+        #     Resposta do LLM:
+        #     {response_text}\n\n
+        # """
+        # print(debug_str)
         return json.loads(response_text)
         
     except Exception as e:
