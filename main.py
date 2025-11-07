@@ -1,4 +1,5 @@
 import argparse
+import pathlib
 import json
 import time
 import fitz # Importa PyMuPDF
@@ -19,11 +20,20 @@ def run_extraction(json_data):
         pdf_file = "./data/files/" + item['pdf_path']
         fitz_dict = get_fitz_dict_from_pdf(pdf_file)
         
+        time_start = time.time()
         results.append(extractor.extract(
             item["label"],
             item["extraction_schema"],
             fitz_dict
         ))
+        end_time = time.time()
+        
+        print(f"Extraction for {item['pdf_path']} took {end_time - time_start:.2f} seconds.")
+
+    # Save results to output.json
+    json_output_path = "./data/output/output.json"
+    pathlib.Path("./data/output/").mkdir(parents=True, exist_ok=True)
+    json.dump(results, open(json_output_path, 'w', encoding='utf-8'), indent=4, ensure_ascii=False)
 
 if __name__ == "__main__":
     
