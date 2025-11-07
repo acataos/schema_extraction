@@ -79,7 +79,6 @@ def calculate_stopwords(texts: list[str], threshold: float = 0.5) -> set[str]:
         Analisa todas as descrições para encontrar palavras comuns
         específicas deste schema (ex: "profissional").
         """
-        print("  Calculando stopwords específicas do schema...")
         if not texts:
             return set()
 
