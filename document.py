@@ -113,14 +113,10 @@ class TextBox:
 
     def is_right_of(self, other: TextBox) -> bool:
         """Verifica se esta caixa está à direita de outra."""
-        # IMPROVEMENT: Adicionar uma tolerância vertical (ex: +/- 5px) para 
-        # permitir "quase" na mesma linha.
         return self.shrinked_x0 > other.shrinked_x1 and abs(self.center_y - other.center_y) < config.ROW_TOLERANCE
 
     def is_below(self, other: TextBox) -> bool:
         """Verifica se esta caixa está abaixo de outra."""
-        # IMPROVEMENT: Adicionar uma tolerância horizontal para permitir 
-        # "quase" na mesma coluna.
         eps = min((other.x1-other.x0)/len(other.text), (self.x1-self.x0)/len(self.text))
         return (self.shrinked_y0 > other.shrinked_y1 and (
                 abs(self.center_x - other.center_x) < (other.shrinked_x1 - other.shrinked_x0)
@@ -130,14 +126,10 @@ class TextBox:
 
     def is_left_of(self, other: TextBox) -> bool:
         """Verifica se esta caixa está à esquerda de outra."""
-        # IMPROVEMENT: Adicionar uma tolerância vertical (ex: +/- 5px) para 
-        # permitir "quase" na mesma linha.
         return self.shrinked_x0 < other.shrinked_x1 and abs(self.center_y - other.center_y) < config.ROW_TOLERANCE
 
     def is_above(self, other: TextBox) -> bool:
         """Verifica se esta caixa está acima de outra."""
-        # IMPROVEMENT: Adicionar uma tolerância horizontal para permitir 
-        # "quase" na mesma coluna.
         eps = min((other.x1-other.x0)/len(other.text), (self.x1-self.x0)/len(self.text))
         return (self.shrinked_y0 < other.shrinked_y1 and (
                 abs(self.center_x - other.center_x) < (other.shrinked_x1 - other.shrinked_x0)
@@ -337,9 +329,6 @@ class Document:
                 for line in group_lines:
                     context_parts.append(line.serialize_layout())
             else:
-                # --- Bloco de Tabela (LÓGICA DE VALOR AUSENTE) ---
-                # Serializa o grupo como uma tabela Markdown
-                
                 # 1. Encontra o número MÁXIMO de colunas nesta tabela
                 max_cols = 0
                 for line in group_lines:
@@ -365,7 +354,6 @@ class Document:
                     start_str = "| "
                     end_str = " |\n"
                     
-                    # --- ESTA É A LÓGICA-CHAVE ---
                     # Cria um "grid" vazio para todas as colunas
                     cells = [""] * max_cols
 
@@ -413,9 +401,6 @@ class Document:
         Encontra o valor mais próximo na 'direction' especificada.
         """
             
-        # IMPROVEMENT: Esta é uma busca O(N). Para documentos enormes,
-        # um K-D Tree ou R-Tree pré-calculado sobre as caixas
-        # tornaria esta busca O(log N). Para uma página, O(N) é aceitável.
         candidates = []
         if direction == 'right':
             candidates = [b for b in self.boxes if b.is_right_of(box)]
@@ -635,10 +620,10 @@ class Document:
                 # mas trate como uma linha normal (table_id = None).
                 pass
         
-        # --- LÓGICA 2 e 3: ADAPTATIVAS (Sua nova proposta) ---
+        # --- LÓGICA 2 e 3: ADAPTATIVAS
         
         # Constante para a heurística de espaçamento
-        # (Um gap > 150% da altura da linha é uma quebra de bloco)
+        # (Uma distância de 5 vezes a altura da linha é uma quebra de bloco)
         GAP_MULTIPLIER = 5
         
         context_lines_set = {line} # Começa com a própria âncora
@@ -694,7 +679,7 @@ class Document:
         Helper privado para encontrar todas as caixas (spans) em uma
         área geométrica da página (ex: 'top_left_quadrant').
         """
-        # Define os limites das áreas. 0.4 (40%) é um bom
+        # Define os limites das áreas. 0.25 é um bom
         # limiar para "canto" sem ser muito restritivo.
         x_left_limit = self.page_width * 0.25
         x_right_limit = self.page_width * 0.75
@@ -838,8 +823,6 @@ class Document:
                 if re.search(pattern, norm_line_text):
                     # Se encontrou, adiciona o OBJETO Line
                     found_lines.add(line)
-                    # Otimização: uma vez que encontramos uma categoria
-                    # nesta linha, não precisamos verificar as outras.
                     break 
         
         return found_lines
@@ -862,10 +845,8 @@ class Document:
             for match in re.finditer(pattern, line.text):
                 candidate = match.group(0)
                 
-                # 3. Executa a validação se ela existir
                 if validator:
                     if validator(candidate):
-                        # É um CPF/CNPJ válido!
                         found_lines.add(line)
                         break # Encontrou um válido, pode parar de procurar nesta linha
                 else:

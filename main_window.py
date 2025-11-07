@@ -2,7 +2,7 @@ import sys
 import os
 import json
 import logging
-import fitz  # Importa o PyMuPDF (fitz)
+import fitz
 from pathlib import Path
 from typing import List, Dict, Any
 
@@ -13,16 +13,12 @@ from PyQt6.QtWidgets import (
     QHeaderView, QSplitter, QSizePolicy,
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem
 )
-# QShortcut e QKeySequence são necessários para Ctrl++ / Ctrl+-
 from PyQt6.QtGui import QPixmap, QImage, QKeySequence, QShortcut
 from PyQt6.QtCore import QThread, QUrl, Qt
 
-# Importa o Worker (que executa a extração em outra thread)
 from worker import Worker
-# Importa seu Extractor (real ou mock)
 from extractor import Extractor
 
-# Configura um logger para este módulo
 logger = logging.getLogger(__name__)
 
 
@@ -50,9 +46,8 @@ class PdfViewer(QGraphicsView):
         # Habilita "clicar e arrastar"
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         
-        # --- MUDANÇA: Fatores de Zoom (Menos Sensível) ---
-        self.zoom_factor_in = 1.1  # Zoom de 10% (era 1.2)
-        self.zoom_factor_out = 0.9 # Zoom de 10% (era 0.8)
+        self.zoom_factor_in = 1.1
+        self.zoom_factor_out = 0.9
         # -----------------------------------------------
 
     def set_pixmap(self, pixmap: QPixmap):
@@ -72,7 +67,6 @@ class PdfViewer(QGraphicsView):
         """Limpa a imagem."""
         self._pixmap_item.setPixmap(QPixmap())
 
-    # --- MUDANÇA: Métodos de Zoom Expostos ---
     def zoom_in(self):
         """Aplica o zoom in."""
         self.scale(self.zoom_factor_in, self.zoom_factor_in)
@@ -87,9 +81,9 @@ class PdfViewer(QGraphicsView):
         if event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             delta = event.angleDelta().y()
             if delta > 0:
-                self.zoom_in()  # Chama o novo método
+                self.zoom_in()
             elif delta < 0:
-                self.zoom_out() # Chama o novo método
+                self.zoom_out()
             event.accept()
         else:
             super().wheelEvent(event)
@@ -111,8 +105,6 @@ class MainWindow(QMainWindow):
         self.current_job_index: int = 0
         self.extraction_results: List[Dict[str, Any]] = []
 
-        # (Estado de zoom foi removido daqui)
-
         try:
             self.extractor = Extractor()
         except Exception as e:
@@ -131,7 +123,7 @@ class MainWindow(QMainWindow):
         # --- 3. Inicializa e Estiliza a UI ---
         self._init_ui()
         self._update_button_states(is_busy=False)
-        self._setup_shortcuts()  # <-- Configura os atalhos (Ctrl+, Ctrl-)
+        self._setup_shortcuts()
 
         self.setStyleSheet("""
             QWidget {
@@ -339,8 +331,6 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+="), self).activated.connect(self.pdf_viewer.zoom_in)
         QShortcut(QKeySequence("Ctrl+-"), self).activated.connect(self.pdf_viewer.zoom_out)
         QShortcut(QKeySequence("Ctrl+0"), self).activated.connect(self._on_view_reset)
-
-    # (wheelEvent foi movido para a classe PdfViewer)
 
     # --- Funções de Lógica (Slots) ---
 

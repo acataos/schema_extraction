@@ -46,9 +46,8 @@ class Worker(QObject):
             
             for i, job in enumerate(self.jobs):
                 if not self._is_running:
-                    break # Permite o cancelamento (não implementado, mas é uma boa prática)
+                    break
 
-                # --- O Trabalho Real ---
                 # 1. Abrir o PDF e extrair o 'dict' (trabalho do PyMuPDF)
                 try:
                     label = job["label"]
@@ -71,7 +70,7 @@ class Worker(QObject):
                 except Exception as e:
                     raise Exception(f"Falha ao ler PDF {pdf_name}: {e}")
                 
-                # 3. Chama sua função 'extract' com o label/schema do trabalho
+                # 3. Chama 'extract' com o label/schema do trabalho
                 result_dict = self.extractor.extract(
                     label, 
                     schema, 
