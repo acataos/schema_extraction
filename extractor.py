@@ -14,7 +14,7 @@ from thefuzz import fuzz
 from text_utils import stopword_filter, calculate_stopwords, normalize_text, is_isolated_word_in
 from pattern_utils import PATTERN_KEYWORDS, STRONG_PATTERNS
 
-JACCARD_THRESHOLD = 0.6
+JACCARD_THRESHOLD = 0.95
 FULL_SCHEMAS = dict() # armazena schemas completos para análises futuras
 
 # Carregamos os modelos globalmente
@@ -131,8 +131,8 @@ class Extractor:
             return None
 
     def _get_key_similarity_map(self, full_schema: dict, 
-                                name_threshold: int = 80, 
-                                desc_threshold: float = 0.8,
+                                name_threshold: int = 85, 
+                                desc_threshold: float = 0.85,
                                 stopwords: Set[str] = None) -> Dict[str, Set[str]]:
         """
         Compara todas as chaves contra si mesmas usando uma abordagem HÍBRIDA:
@@ -231,93 +231,129 @@ class Extractor:
         # print("Similarity Map:", {k: list(v) for k, v in key_similarity_map.items()})
 
         final_results = {}
-        keys_for_llm = [] # Chaves que falharam no fast-path
+        claimed_values_mask = set()
 
-        # --- PASSO 2: FAST PATH CATEGÓRICO (COM LÓGICA DE SEGURANÇA) ---
-        for key, description in FULL_SCHEMAS[label].items():
+        unsolved_categorical_keys = set()
+        unsolved_pattern_keys = set()
+
+        for key in FULL_SCHEMAS[label].keys():
             if key in category_map:
-                categories = category_map[key]
-                found_values_set = doc.search_for_categories(categories)
-                
-                # 1. Condição de Exclusividade Intra-Campo:
-                if len(found_values_set) == 1:
-                    found_value = list(found_values_set)[0]
-                    norm_found_value = normalize_text(found_value)
-                    
-                    # 2. Condição de Exclusividade Inter-Campo:
-                    keys_sharing_this_category = global_cat_to_keys_map.get(norm_found_value, [])
-                    
-                    if len(keys_sharing_this_category) == 1 and keys_sharing_this_category[0] == key:
-                        if key in extraction_schema:
-                            #mask it
-                            final_results[key] = found_value
-                        else:
-                            #mask it
-                            pass
-                    else:
-                        pass
-                
-                elif len(found_values_set) > 1:
-                    pass
-                # achou nada => nao tem
-                elif key in extraction_schema:
-                    final_results[key] = None
-
+                unsolved_categorical_keys.add(key)
             elif key in strong_pattern_map:
-                pattern_type = pattern_map[key]
-                
-                # 1. Busca pela "Label" (Âncora)
-                anchor_lines = doc.get_keyword_matching_lines(key) 
-                
-                # 2. Grade de Segurança 1: Unicidade
-                value_candidate_texts = [] # O texto que vamos validar
-                for anchor_line in anchor_lines:
-                    # 3. Heurística de Busca Espacial
-                    # Heurística A: O valor está na mesma caixa? (Ex: "CPF: 123.456...")
-                    for box in anchor_line.boxes:
-                        if ":" in box.text:
-                            parts = box.text.split(":", 1)
-                            key_part = parts[0]
-                            val_part = parts[1].strip()
-                            # Compara a chave (label) com a 1ª parte
-                            if fuzz.ratio(normalize_text(key), normalize_text(key_part)) > 90 and val_part:
-                                value_candidate_texts.append(val_part)
-                        box_text = normalize_text(box.text)
-                        key_text = normalize_text(key).replace("_", " ")
-                        if fuzz.ratio(box_text, key_text) > 90:
-                            # check box to the right
-                            box_to_right = doc.find_close_box(box, 'right')
-                            if box_to_right:
-                                value_candidate_texts.append(box_to_right.text)
-                            # check box below
-                            box_below = doc.find_close_box(box, 'below')
-                            if box_below:
-                                value_candidate_texts.append(box_below.text)
+                unsolved_pattern_keys.add(key)
 
-                    # 4. Grade de Segurança 2: Validação de Padrão
-                values_to_remove = set()
-                for value_candidate_text in value_candidate_texts:
-                    if not doc.validate_string(value_candidate_text, pattern_type):
-                        values_to_remove.add(value_candidate_text)
-                value_candidate_texts = set(value_candidate_texts) - values_to_remove
+        solved_keys = set()
 
-                if len(value_candidate_texts)==1:
-                    value_candidate_text = value_candidate_texts.pop()
-                    # Chama nosso novo método validador no Document
-                    print(f"    [FAST PATH HIT] Chave de Padrão '{key}' resolvida: '{value_candidate_text}'")
+        found_last_time = True
+        i = len(unsolved_pattern_keys)
+        while found_last_time and len(unsolved_pattern_keys) and i>=0:
+            found_last_time = False
+            for key in unsolved_pattern_keys:
+                pattern_type = strong_pattern_map[key]
+                candidates = doc.pattern_matches_map.get(pattern_type, [])
+                available_candidates = [c for c in candidates if c not in claimed_values_mask]
+
+                if len(available_candidates) == 0:
                     if key in extraction_schema:
-                        # mask it
-                        final_results[key] = value_candidate_text
-                    else:
-                        # mask it
-                        pass
-                    continue # Sucesso! Pula para a próxima chave
-            
+                        final_results[key] = None
+                    solved_keys.add(key) 
 
-            # Se qualquer falha ocorrer, ou se não for categórica,
-            # a chave é adicionada para o pipeline do LLM.
-            if key in extraction_schema:
-                keys_for_llm.append(key)
+                score_threshold = 90
+
+                for candidate in candidates:
+                    if candidate in claimed_values_mask:
+                        continue
+
+                    is_match = False
+                    value_box, span = candidate
+                    candidate_keys = []
+                    normalized_key = normalize_text(key).replace("_", " ")
+                    # search inside box 
+                    normalized_box_text = normalize_text(value_box.text.replace("_", " "))
+                    for i in range(span[0]):
+                        candidate_key = normalized_box_text[i:i+len(normalized_key)]
+                        score = fuzz.ratio(normalized_key, candidate_key)
+
+                        if score > score_threshold:
+                            is_match = True
+                    # search left box
+                    if not is_match:
+                        left_box = doc.find_close_box(value_box, 'left')
+                        above_box = doc.find_close_box(value_box, 'above')
+                        neighbor_boxes = [left_box, above_box]
+                        for box in neighbor_boxes:
+                            if box is not None:
+                                box_text = normalize_text(box.text.replace("_", " "))
+                                score = fuzz.ratio(normalized_key, box_text)
+
+                                if score > score_threshold:
+                                    is_match = True
+                    if is_match:
+                        found_last_time = True
+                        text = candidate[0].text
+                        span = candidate[1]
+                        if key in extraction_schema:
+                            final_results[key] = text[span[0]:span[1]]
+                        claimed_values_mask.add(candidate)
+                        solved_keys.add(key) 
+
+            unsolved_pattern_keys -= solved_keys    
+            i -= 1
+
+        all_categories = set()
+        for key, categories in category_map.items():
+            all_categories.update(categories)
+
+        cat_to_loc_map = doc.search_for_categories(all_categories)
+        # --- PASSO 2: FAST PATH CATEGÓRICO (COM LÓGICA DE SEGURANÇA) ---
+        found_last_time = True
+        i = len(unsolved_categorical_keys)
+        while found_last_time and len(unsolved_categorical_keys) and i>=0:
+            found_last_time = False
+            for key, description in FULL_SCHEMAS[label].items():
+                if key in category_map:
+                    categories = category_map[key]
+                    normalized_categories = [normalize_text(cat) for cat in categories]
+                    non_empty_categories = [cat for cat in normalized_categories if len(cat_to_loc_map[cat])]
+                    
+                    # 1. Condição de Exclusividade Intra-Campo:
+                    if len(non_empty_categories) == 1:
+                        found_cat = non_empty_categories[0]
+                        found_box, span = list(cat_to_loc_map[found_cat])[0]
+                        found_value = found_box.text[span[0]:span[1]]
+                        norm_found_value = normalize_text(found_value)
+                        
+                        # 2. Condição de Exclusividade Inter-Campo:
+                        keys_sharing_this_category = set(global_cat_to_keys_map.get(norm_found_value, []))
+                        unsolved_keys_sharing_this_category = keys_sharing_this_category.intersection(unsolved_categorical_keys)
+                        
+                        if len(unsolved_keys_sharing_this_category) >= len(cat_to_loc_map[found_cat]):
+                            claimed_values_mask.add(cat_to_loc_map[found_cat].pop())
+                            if key in extraction_schema:
+                                final_results[key] = found_value
+                            solved_keys.add(key)
+                            found_last_time = True
+                        else:
+                            pass
+                    
+                    elif len(non_empty_categories) > 1:
+                        # mais de uma categoria encontrada => ambíguo
+                        pass
+                    elif key in extraction_schema:
+                        # achou nada => nao tem
+                        solved_keys.add(key)
+                        final_results[key] = None
+
+            unsolved_categorical_keys -= solved_keys
+            i -= 1
+
+        keys_for_llm = [k for k in extraction_schema.keys() if k not in final_results]
+        # flag masked boxes
+        doc.mask_boxes(claimed_values_mask)
+        # print(solved_keys)
+        # print("Chaves restantes para LLM:", keys_for_llm)
+        # print("Resultados parciais após Fast Path:", final_results)
+        # breakpoint()
         
         # Se não houver chaves restantes, podemos pular tudo
         if not keys_for_llm:
@@ -381,6 +417,12 @@ class Extractor:
                 inflated_snippets.update(context_lines_indices)
             
             retrieved_snippets_by_key[key] = frozenset(inflated_snippets)
+        # for k,v in retrieved_snippets_by_key.items():
+        #     print()
+        #     print("Retrieved snippets for key", k)
+        #     print()
+        #     print(doc.serialize_snippets_for_llm(v))
+        # breakpoint()
 
         # --- PASSO 5: AGRUPAMENTO (BATCHING) ---
         # print("  Iniciando Passo 5: Agrupamento (Jaccard)...")
@@ -431,20 +473,15 @@ class Extractor:
             all_similar_keys_for_group = set()
             for key in current_group:
                 similar_keys = key_similarity_map.get(key, set())
-                keys_to_merge = similar_keys.intersection(missing_keys)
+                keys_to_merge = similar_keys.intersection(missing_keys - solved_keys)
                 all_similar_keys_for_group.update(keys_to_merge)
             
             merged_groups.append(all_similar_keys_for_group.union(current_group))
+            # merged_groups.append(current_group)
         
         final_groups: List[Set[str]] = merged_groups
         MAX_CONCURRENT_CALLS = 5 
-        start_serialize = time.time()
-        for key_group_set in final_groups:
-            all_snippets_indices = set().union(*(retrieved_snippets_by_key.get(key, set()) for key in key_group_set))
-            context = doc.serialize_snippets_for_llm(all_snippets_indices)
-        end_serialize = time.time()
 
-        print(f"--- Tempo de serialização de snippets: {end_serialize - start_serialize:.2f} segundos ---")
 
         llm_start_time = time.time()
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CALLS) as executor:

@@ -1,4 +1,49 @@
 from validate_docbr import CPF, CNH, CNPJ, CNS, PIS, TituloEleitoral, RENAVAM
+import re
+
+def clean_doc_id(doc_id: str) -> str:
+    """Remove toda a pontuação de uma string de documento."""
+    return re.sub(r'[.\-/]', '', doc_id)
+
+def validate_cpf(cpf: str) -> bool:
+    """Valida um CPF (limpo ou formatado) pelo dígito verificador."""
+    return CPF().validate(cpf)
+
+def validate_cnpj(cnpj: str) -> bool:
+    """Valida um CNPJ (limpo ou formatado) pelo dígito verificador."""
+    return CNPJ().validate(cnpj)
+
+def validate_cnh(cnh: str) -> bool:
+    """Valida um CNH (limpo ou formatado) pelo dígito verificador."""
+    return CNH().validate(cnh)
+
+def validate_cns(cns: str) -> bool:
+    """Valida um CNS (limpo ou formatado) pelo dígito verificador."""
+    return CNS().validate(cns)
+
+def validate_renavam(renavam: str) -> bool:
+    """Valida um RENAVAM (limpo ou formatado) pelo dígito verificador."""
+    return RENAVAM().validate(renavam)
+
+def validate_pis(pis: str) -> bool:
+    """Valida um RENAVAM (limpo ou formatado) pelo dígito verificador."""
+    return PIS().validate(pis)
+
+def validate_titulo_eleitoral(titulo_eleitoral: str) -> bool:
+    """Valida um Titulo Eleitoral (limpo ou formatado) pelo dígito verificador."""
+    return TituloEleitoral().validate(titulo_eleitoral)
+
+def validate_other_id(id: str):
+    # first assert that its not a match for any other pattern
+    for (pattern_type,pattern) in PATTERNS.items():
+        if pattern_type == "other_id":
+            continue
+        is_veritable = pattern_type in VALIDATORS
+        if re.fullmatch(pattern, id) and not is_veritable:
+            return False
+        elif re.fullmatch(pattern, id) and VALIDATORS[pattern_type](_clean_doc_id(id)):
+            return False
+    return True
 
 PATTERNS = {
     "cpf": r"\b(\d{11}|\d{3}\.\d{3}\.\d{3}-\d{2})\b",
@@ -47,6 +92,7 @@ PATTERN_KEYWORDS = {
     "quantia": "money",
     "saldo": "money",
     # "quantidade": "quantity",
+    "cep": "cep",
     "endereco": "cep",
     "logradouro": "cep",
     "contrato": "id",
@@ -59,49 +105,9 @@ STRONG_PATTERNS = {
     "cnh",
     "data",
     "cns",
+    "cep"
     "pis",
     "rg",
-    "identidade",
     "renavam",
     "titulo_eleitoral",
 }
-def clean_doc_id(doc_id: str) -> str:
-    """Remove toda a pontuação de uma string de documento."""
-    return re.sub(r'[.\-/]', '', doc_id)
-
-def validate_cpf(cpf: str) -> bool:
-    """Valida um CPF (limpo ou formatado) pelo dígito verificador."""
-    return CPF().validate(cpf)
-
-def validate_cnpj(cnpj: str) -> bool:
-    """Valida um CNPJ (limpo ou formatado) pelo dígito verificador."""
-    return CNPJ().validate(cnpj)
-
-def validate_cnh(cnh: str) -> bool:
-    """Valida um CNH (limpo ou formatado) pelo dígito verificador."""
-    return CNH().validate(cnh)
-
-def validate_cns(cns: str) -> bool:
-    """Valida um CNS (limpo ou formatado) pelo dígito verificador."""
-    return CNS().validate(cns)
-
-def validate_renavam(renavam: str) -> bool:
-    """Valida um RENAVAM (limpo ou formatado) pelo dígito verificador."""
-    return RENAVAM().validate(renavam)
-
-def validate_pis(pis: str) -> bool:
-    """Valida um RENAVAM (limpo ou formatado) pelo dígito verificador."""
-    return PIS().validate(pis)
-
-def validate_titulo_eleitoral(titulo_eleitoral: str) -> bool:
-    """Valida um Titulo Eleitoral (limpo ou formatado) pelo dígito verificador."""
-    return TituloEleitoral().validate(titulo_eleitoral)
-
-def validate_other_id(id: str):
-    # first assert that its not a match for any other pattern
-    for pattern in (pattern_type,pattern) in PATTERNS.items():
-        if pattern_type == "other_id":
-            continue
-        if re.fullmatch(pattern, id) and VALIDATORS[pattern_type](_clean_doc_id(id)):
-            return False
-    return True

@@ -2,12 +2,13 @@ from __future__ import annotations
 import itertools
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
+from collections import defaultdict 
 import config
 from sentence_transformers import SentenceTransformer, util
 from thefuzz import fuzz
 import torch
 from text_utils import fuzzy_match, normalize_text
-from pattern_utils import PATTERNS, VALIDATORS
+from pattern_utils import PATTERNS, VALIDATORS, STRONG_PATTERNS
 import re
 
 
@@ -33,8 +34,26 @@ class Line:
     def y1(self) -> float:
         return max(b.y1 for b in self.boxes)
 
+    @property
+    def center_x(self) -> float:
+        return sum((b.center_x for b in self.boxes)) / len(self.boxes)
+
+    @property
+    def height(self) -> float:
+        return self.y1 - self.y0
+
     def __len__(self):
         return len(self.boxes)
+
+    def v_dist(self, other_line : Line) -> float:
+        """Calcula a distância vertical entre esta linha e outra."""
+        return max(other_line.y0 - self.y1, self.y0 - other_line.y1)
+
+    def h_dist(self, other_line : Line) -> float:
+        return abs(self.center_x - other_line.center_x)
+
+    def distance(self, other_line : Line) -> float:
+        return (self.v_dist(other_line)**2 + self.h_dist(other_line)**2)**0.5
 
     def serialize_layout(self) -> str:
         """
@@ -42,7 +61,7 @@ class Line:
         separando os spans (caixas) com um delimitador.
         """
         # Filtra spans vazios, se houver
-        texts = [b.text for b in self.boxes if b.text.strip()]
+        texts = [b.masked_text() for b in self.boxes if b.masked_text().strip()]
         
         # ex: "Pesquisar por: | CLIENTE | Tipo: | CPF"
         return " | ".join(texts)
@@ -66,6 +85,7 @@ class TextBox:
     line_idx: int = field(default=None, compare=False)
     value: str = field(default=None, compare=False)
     col_index: int = field(default=None, compare=False)
+    masks: set[Tuple[int, int]] = field(default_factory=set, compare=False)
 
     @property
     def center_y(self) -> float:
@@ -108,6 +128,23 @@ class TextBox:
                 or self.x1 - eps <= other.x1 <= self.x1 + eps
         ))
 
+    def is_left_of(self, other: TextBox) -> bool:
+        """Verifica se esta caixa está à esquerda de outra."""
+        # IMPROVEMENT: Adicionar uma tolerância vertical (ex: +/- 5px) para 
+        # permitir "quase" na mesma linha.
+        return self.shrinked_x0 < other.shrinked_x1 and abs(self.center_y - other.center_y) < config.ROW_TOLERANCE
+
+    def is_above(self, other: TextBox) -> bool:
+        """Verifica se esta caixa está acima de outra."""
+        # IMPROVEMENT: Adicionar uma tolerância horizontal para permitir 
+        # "quase" na mesma coluna.
+        eps = min((other.x1-other.x0)/len(other.text), (self.x1-self.x0)/len(self.text))
+        return (self.shrinked_y0 < other.shrinked_y1 and (
+                abs(self.center_x - other.center_x) < (other.shrinked_x1 - other.shrinked_x0)
+                or self.x0 - eps <= other.x0 <= self.x0 + eps
+                or self.x1 - eps <= other.x1 <= self.x1 + eps
+        ))
+
     def is_similar(self, other: TextBox) -> bool:
         """Verifica se esta caixa é similar a outra (baseado em posição e tamanho da fonte)."""
         return abs(self.font_size - other.font_size) <= 0.5 and self.font==other.font
@@ -132,6 +169,16 @@ class TextBox:
             font=new_font,
             line_idx=self.line_idx
         )
+    
+    def save_mask(self, span: Tuple[int, int]) -> None:
+        self.masks.add(span)
+    
+    def masked_text(self) -> str:
+        text = self.text
+        for span in self.masks:
+            start, end = span
+            text = text[:start] + ("*" * (end - start)) + text[end:]
+        return text.replace("*","")
 
 
 class Document:
@@ -156,6 +203,9 @@ class Document:
         self.min_font_size = min(b.font_size for b in self.boxes)
         self.tables_dict = dict()  # Mapeia table_id para listas de índices de linhas
         self.column_order_dict = dict()
+
+        self.pattern_matches_map = defaultdict(list)  # Mapeia tipo de padrão para listas de (TextBox, matched_str)
+        self._find_all_pattern_matches()
 
 
     def _parse_spans(self, page_dict: dict) -> List[TextBox]:
@@ -351,16 +401,16 @@ class Document:
                     for j,box in enumerate(line.boxes):
                         if box.col_index is not None:
                             cell_ind = self.column_order_dict[table_id].index(box.col_index) 
-                            cells[cell_ind] += box.text + " "
+                            cells[cell_ind] += box.masked_text() + " "
                         elif j==0 and box.col_index is None:
-                            start_str = f"{box.text} |"
+                            start_str = f"{box.masked_text()} |"
                         elif j==len(line.boxes)-1 and box.col_index is None:
-                            end_str = f"| {box.text}\n"
+                            end_str = f"| {box.masked_text()}\n"
                         else:
                             if cell_ind is None:
-                                start_str = f"{start_str[:-1]}; {box.text} |" 
+                                start_str = f"{start_str[:-1]}; {box.masked_text()} |" 
                                 continue
-                            cells[cell_ind] += f"[{box.text}] "
+                            cells[cell_ind] += f"[{box.masked_text()}] "
                     
                     # Limpa espaços extras
                     cells_cleaned = [c.strip() for c in cells]
@@ -403,6 +453,18 @@ class Document:
             
         elif direction == 'below':
             candidates = [b for b in self.boxes if b.is_below(box) and box.line_idx<=b.line_idx<= box.line_idx + 2]
+            if not candidates: return None
+            # Retorna o mais próximo verticalmente
+            return min(candidates, key=lambda b: b.y0)
+
+        elif direction == 'left':
+            candidates = [b for b in self.boxes if b.is_left_of(box)]
+            if not candidates: return None
+            # Retorna o mais próximo verticalmente
+            return min(candidates, key=lambda b: b.y0)
+
+        elif direction == 'above':
+            candidates = [b for b in self.boxes if b.is_above(box) and box.line_idx-2<=b.line_idx<= box.line_idx]
             if not candidates: return None
             # Retorna o mais próximo verticalmente
             return min(candidates, key=lambda b: b.y0)
@@ -536,29 +598,25 @@ class Document:
         """
         # Compila os RegEx uma vez
         compiled_patterns = [
-            (ptype, re.compile(patt)) for ptype, patt in PATTERNS.items() if ptype 
+            (ptype, re.compile(patt)) for ptype, patt in PATTERNS.items()
         ]
 
         for line in self.lines:
             for box in line.boxes:
                 for ptype, compiled_re in compiled_patterns:
-                    # 'id' e 'quantity' são muito genéricos para este método
-                    if ptype in ("id", "quantity"): 
-                        continue
-
                     for match in compiled_re.finditer(box.text):
+                        candidate_span = match.span()
                         candidate_str = match.group(0)
-                        
                         # Se houver um validador, use-o
                         validator = VALIDATORS.get(ptype)
                         if validator:
                             if validator(candidate_str):
-                                self.pattern_matches_map[ptype].append((box, candidate_str))
-                                break # Box correspondeu, vá para o próximo box
+                                self.pattern_matches_map[ptype].append((box, candidate_span))
+                                break
                         else:
                             # Se não houver validador (ex: money, phone),
                             # a correspondência do RegEx é suficiente
-                            self.pattern_matches_map[ptype].append((box, candidate_str))
+                            self.pattern_matches_map[ptype].append((box, candidate_span))
                             break # Box correspondeu, vá para o próximo box
 
     def embed_spans(self, embedding_model: SentenceTransformer):
@@ -685,7 +743,7 @@ class Document:
         
         # Constante para a heurística de espaçamento
         # (Um gap > 150% da altura da linha é uma quebra de bloco)
-        GAP_MULTIPLIER = 1.5
+        GAP_MULTIPLIER = 5
         
         context_lines_set = {line} # Começa com a própria âncora
         current_index = line.idx
@@ -701,11 +759,11 @@ class Document:
                 break
             
             # LÓGICA 2: Heurística de Espaçamento
-            gap = neighbor_line.y0 - prev_line.y1
+            dist = prev_line.distance(neighbor_line)
             line_height = prev_line.y1 - prev_line.y0
             if line_height <= 0: line_height = 1 # Evita divisão por zero
             
-            if gap > (line_height * GAP_MULTIPLIER):
+            if dist > (line_height * GAP_MULTIPLIER):
                 break # Encontrou uma grande lacuna; fim do bloco
             
             # Se passou: a linha é conectada
@@ -722,11 +780,11 @@ class Document:
                 break
                 
             # LÓGICA 2: Heurística de Espaçamento
-            gap = next_line.y0 - neighbor_line.y1
+            dist = neighbor_line.distance(next_line)
             line_height = neighbor_line.y1 - neighbor_line.y0
             if line_height <= 0: line_height = 1
             
-            if gap > (line_height * GAP_MULTIPLIER):
+            if dist > (line_height * GAP_MULTIPLIER):
                 break # Encontrou uma grande lacuna; fim do bloco
             
             # Se passou: a linha é conectada
@@ -815,7 +873,7 @@ class Document:
         return matched_lines
 
 
-    def search_for_categories(self, categories: List[str]) -> Set[str]:
+    def search_for_categories(self, categories: Set[str]) -> Dict[str, (TextBox, Tuple[int,int])]:
         """
         Busca o documento por uma lista de categorias.
         
@@ -830,19 +888,21 @@ class Document:
             encontrados no texto* (ex: {"Vencido", "NOME FANTASIA"}).
         """
         
-        found_original_values = set()
-        
+        cat_to_loc_dict = dict()
         # 1. Normaliza as categorias do schema para a busca
         # (ex: ["vencido", "pago", "nome fantasia"])
         norm_categories = [normalize_text(cat) for cat in categories]
+        for cat in norm_categories:
+            cat_to_loc_dict[cat] = set()
+        
         
         # 2. Itera sobre todas as linhas do documento
-        for line in self.lines:
+        for box in self.boxes:
             
             # 3. Pega os dois textos: original e normalizado
-            original_line_text = line.text 
+            original_box_text = box.text 
             # (ex: "Cliente: NOME FANTASIA | Tipo: Advogado")
-            norm_line_text = normalize_text(original_line_text)
+            norm_box_text = normalize_text(original_box_text)
             # (ex: "cliente: nome fantasia | tipo: advogado")
 
             # 4. Itera sobre as categorias normalizadas
@@ -856,17 +916,11 @@ class Document:
                 
                 # 6. Busca no texto NORMALIZADO
                 #    Usamos re.finditer para pegar todas as ocorrências
-                for match in re.finditer(pattern, norm_line_text, re.IGNORECASE):
+                for match in re.finditer(pattern, norm_box_text, re.IGNORECASE):
                     # 7. Pegar os índices do match
-                    start_index = match.start()
-                    end_index = match.end()
+                    cat_to_loc_dict[norm_cat].add((box, match.span()))
                     
-                    # 8. SUCESSO! Usar os índices para fatiar o texto ORIGINAL
-                    original_value = original_line_text[start_index:end_index]
-                    
-                    found_original_values.add(original_value)
-        
-        return found_original_values
+        return cat_to_loc_dict
 
     def get_categorical_snippets(self, categories: List[str]) -> set[Line]:
         """
@@ -900,10 +954,6 @@ class Document:
         Busca no documento por linhas que contenham um padrão (RegEx)
         específico, com validação para CPF/CNPJ.
         """
-        
-        
-        # 2. Mapeia tipos para suas funções de validação
-
         pattern = PATTERNS.get(pattern_type)
         if not pattern:
             return set()
@@ -936,7 +986,6 @@ class Document:
         
         Usado pelo "Pattern Fast Path" do Extractor.
         """
-        
         pattern = PATTERNS.get(pattern_type)
         if not pattern:
             return False # Tipo de padrão desconhecido
@@ -955,3 +1004,17 @@ class Document:
                 
         # 5. Sucesso: Passou em ambas as grades
         return True
+
+    def mask_boxes(self, box_locators: set[(TextBox, Tuple[int,int])]) -> None:
+        """
+        Aplica máscaras de anonimização nas caixas (spans)
+        e posições especificadas.
+        
+        Args:
+            box_locators: Um conjunto (set) de tuplas
+                           (TextBox, (start_idx, end_idx))
+                           indicando quais caixas e posições
+                           dentro delas devem ser mascaradas.
+        """
+        for box, span in box_locators:
+            box.save_mask(span)
