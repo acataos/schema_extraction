@@ -66,6 +66,13 @@ Defina a variável de ambiente OPENAI_API_KEY com sua chave de API da OpenAI.
 export OPENAI_API_KEY="sua_chave_aqui"  # Linux/Mac
 ```
 
+Finalmente, rode
+```
+python save_embedding_model.py
+```
+
+Agora está tudo pronto para rodar a aplicação!
+
 ### Executando a Aplicação
 
 #### CLI:
