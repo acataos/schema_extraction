@@ -12,12 +12,12 @@ def get_fitz_dict_from_pdf(pdf_path: str) -> dict:
         page = doc[0] # Pega a primeira página
         return page.get_text("dict")
 
-def run_extraction(json_data):
+def run_extraction(json_data, parent_dir):
     extractor = Extractor()
     
     results = []
     for item in json_data:
-        pdf_file = "./data/files/" + item['pdf_path']
+        pdf_file = parent_dir / item['pdf_path']
         fitz_dict = get_fitz_dict_from_pdf(pdf_file)
         
         time_start = time.time()
@@ -46,10 +46,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
     logging.basicConfig(level=args.loglevel)
+    parent_dir = pathlib.Path(args.json_file).parent
 
     # read json file
     with open(args.json_file, 'r', encoding='utf-8') as f:
         json_data = json.load(f)
 
-    results = run_extraction(json_data)
+    results = run_extraction(json_data, parent_dir)
 

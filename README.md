@@ -76,7 +76,7 @@ export OPENAI_API_KEY="sua_chave_aqui"  # Linux/Mac
 
 #### CLI
 
-Prepare sua Fila de Jobs: Crie um arquivo ``fila.json`` (ou qualquer nome) que contenha uma lista de jobs. O pdf_path deve ser relativo ao diretório onde o ``fila.json`` está.
+Prepare sua fila de Jobs: Crie um arquivo ``fila.json`` (ou qualquer nome) que contenha uma lista de jobs. O pdf_path deve ser relativo ao diretório onde o ``fila.json`` está.
 
 JSON
 ```
