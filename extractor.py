@@ -528,6 +528,6 @@ class Extractor:
         for key in missing_keys:
             if key in final_results:
                 del final_results[key]
-        logger.info(f"Resultados Finais para label {label}: {final_results}")
+        print("Resultados finais para label", label, ":", final_results)
                 
         return final_results
