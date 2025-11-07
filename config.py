@@ -2,7 +2,7 @@ import torch
 
 # --- Model Settings ---
 LLM_MODEL_NAME = "gpt-5-mini"
-EMBEDDING_MODEL_PATH = 'sentence_transformer'
+EMBEDDING_MODEL_PATH = 'sentence_transformers_model'
 
 # --- Semantic Match Settings ---
 SEMANTIC_MATCH_THRESHOLD = 0.6
@@ -12,7 +12,7 @@ ROW_TOLERANCE = 5
 
  # --- Snippet Retrieval Settings ---
 SNIPPET_K_KEYWORDS = 2
-SNIPPET_K_SEMANTIC = 1
+SNIPPET_K_SEMANTIC = 0
 
 # --- Global Device Setting ---
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
