@@ -301,34 +301,6 @@ class Document:
                 del box
 
 
-
-    def serialize_layout_for_llm(self) -> str:
-        """
-        Cria uma representação textual do layout para o prompt do LLM.
-        
-        IMPROVEMENT: Isso pode ser muito verboso. Uma versão melhor poderia
-        enviar apenas caixas dentro de uma 'janela' relevante, ou
-        simplificar a serialização (ex: "Linha 1: [Texto 1] [Texto 2]").
-        """
-        return "\n".join([
-            f"[text: '{b.text}', x0: {b.x0:.0f}, y0: {b.y0:.0f}, size: {b.font_size:.0f}]" 
-            for b in self.boxes
-        ])
-
-    def serialize_layout(self) -> str:
-        """
-        Cria uma representação textual do layout para o prompt do LLM.
-        
-        IMPROVEMENT: Isso pode ser muito verboso. Uma versão melhor poderia
-        enviar apenas caixas dentro de uma 'janela' relevante, ou
-        simplificar a serialização (ex: "Linha 1: [Texto 1] [Texto 2]").
-        """
-        s = ""
-        for line in self.lines:
-            s+= line.serialize_layout() + "\n"
-
-        return s
-
     def serialize_snippets_for_llm(self, line_indices: Set[int] = None) -> str:
         """
         Serializa um conjunto de linhas de forma inteligente para o LLM,
@@ -471,82 +443,6 @@ class Document:
         
         return None # Direção não suportada
 
-    def find_text_by_font(self, op: str = 'largest') -> Optional[TextBox]:
-        """Encontra o texto baseado no tamanho da fonte (maior ou menor)."""
-        if op == 'largest':
-            target_size = self.max_font_size
-        elif op == 'smallest':
-            target_size = self.min_font_size
-        else:
-            return None
-            
-        # Retorna o primeiro span que bate com o tamanho
-        # IMPROVEMENT: Pode haver múltiplos. Isso poderia retornar uma
-        # lista ou concatenar todos os spans de texto com esse tamanho.
-        for box in self.boxes:
-            if box.font_size == target_size:
-                return box
-        return None
-
-    def find_box_by_position(self, corner: str) -> Optional[TextBox]:
-        """Encontra a caixa de texto mais próxima de um canto da página."""
-        page_w = self.page_bbox[2]
-        page_h = self.page_bbox[3]
-        
-        if corner == 'top_left':
-            # Pondera y ligeiramente mais para priorizar a linha superior
-            return min(self.boxes, key=lambda b: b.x0 * 0.8 + b.y0)
-        elif corner == 'bottom_right':
-            # Pondera a distância de x/y do canto oposto
-            return min(self.boxes, key=lambda b: (page_w - b.x1) + (page_h - b.y1))
-        
-        # IMPROVEMENT: Adicionar 'top_right' e 'bottom_left'
-        return None
-
-    def find_table_row_values(self, header_box: TextBox) -> List[TextBox]:
-        """
-        Encontra uma linha de cabeçalho e retorna os valores da linha abaixo.
-        Esta é a lógica de tabela mais complexa.
-        """
-        # 1. Encontra todas as caixas na mesma linha do cabeçalho
-        header_row = [b for b in self.boxes if abs(b.center_y - header_box.center_y) < config.ROW_TOLERANCE]
-        header_row.sort() # Ordena por x0
-        
-        # 2. Define as "colunas" com base nos centros x dos cabeçalhos
-        columns_x_centers = [b.center_x for b in header_row]
-        
-        # 3. Encontra a próxima linha de texto abaixo
-        first_box_below = None
-        min_y_dist = float('inf')
-        
-        for b in self.boxes:
-            if b.y0 > header_box.y1 + config.ROW_TOLERANCE / 2: # Se está abaixo
-                dist = b.y0 - header_box.y1
-                if dist < min_y_dist:
-                    min_y_dist = dist
-                    first_box_below = b
-        
-        if not first_box_below:
-            return []
-            
-        # 4. Pega todas as caixas nessa linha de valor
-        value_row = [b for b in self.boxes if abs(b.center_y - first_box_below.center_y) < config.ROW_TOLERANCE]
-        
-        # 5. Mapeia os valores para as colunas de cabeçalho
-        # IMPROVEMENT: Esta é uma heurística simples. Uma lógica mais
-        # robusta usaria 'find_nearest' para o centro x, ou lidaria
-        # com valores que abrangem múltiplas colunas.
-        mapped_values = []
-        for val_box in value_row:
-            # Encontra a coluna (índice) à qual este valor pertence
-            col_index = min(range(len(columns_x_centers)), 
-                            key=lambda i: abs(val_box.center_x - columns_x_centers[i]))
-            mapped_values.append((col_index, val_box))
-            
-        # Retorna as caixas de valor ordenadas pela coluna
-        mapped_values.sort()
-        return [box for _, box in mapped_values]
-    
 
     def find_tables(self):
         for line in self.lines:
