@@ -59,7 +59,8 @@ def find_values_from_layout(client: OpenAI, context: str, schema_group: Dict[str
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": human_prompt}
             ],
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            timeout=9.4
         )
         response_text = response.choices[0].message.content
 
