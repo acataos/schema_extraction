@@ -25,7 +25,6 @@ def find_values_from_layout(client: OpenAI, context: str, schema_group: Dict[str
     -   Analise os "TRECHOS DE CONTEXTO" fornecidos.
     -   Para cada chave no "GRUPO DE CAMPOS PARA EXTRAIR", encontre o valor
         correspondente no contexto.
-    -   Verifique o "GRUPO DE CAMPOS EXCLUÍDOS" e NÃO extraia valores para essas chaves.
     -   Se um valor não for encontrado, retorne null para essa chave.
     -   Responda APENAS com um objeto JSON contendo os valores extraídos.
 
@@ -62,15 +61,8 @@ def find_values_from_layout(client: OpenAI, context: str, schema_group: Dict[str
             ],
             response_format={"type": "json_object"}
         )
-        # response_text = response.choices[0].message.content
-        # debug_str = f"""\n\n
-        #     Chamando LLM para extração de grupo de campos...
-        #     {human_prompt}
-        #     ----------------
-        #     Resposta do LLM:
-        #     {response_text}\n\n
-        # """
-        # print(debug_str)
+        response_text = response.choices[0].message.content
+
         return json.loads(response_text)
         
     except Exception as e:
