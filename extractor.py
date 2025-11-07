@@ -1,4 +1,5 @@
 import time
+import random
 import re
 import logging
 import concurrent.futures
@@ -246,6 +247,7 @@ class Extractor:
             return {key: None for key in extraction_schema}
 
 
+
         # --- PASSO 1: ANÁLISE DO SCHEMA ---
         # (Substitui sua lógica de stopwords)
         descs = list(self.full_schemas[label].values())
@@ -335,7 +337,7 @@ class Extractor:
         i = len(unsolved_categorical_keys)
         while found_last_time and len(unsolved_categorical_keys) and i>=0:
             found_last_time = False
-            for key, description in self.full_schemas[label].items():
+            for key in unsolved_categorical_keys:
                 if key in category_map:
                     categories = category_map[key]
                     normalized_categories = [normalize_text(cat) for cat in categories]
@@ -482,7 +484,7 @@ class Extractor:
         final_groups: List[Set[str]] = merged_groups
 
         # --- PASSO 6: EXTRAÇÃO (LLM EM PARALELO) ---
-        MAX_CONCURRENT_CALLS = 5 
+        MAX_CONCURRENT_CALLS = 5
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CALLS) as executor:
             future_to_group = {}
@@ -529,5 +531,5 @@ class Extractor:
             if key in final_results:
                 del final_results[key]
         print("Resultados finais para label", label, ":", final_results)
-                
+
         return final_results
