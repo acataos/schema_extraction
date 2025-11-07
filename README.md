@@ -60,10 +60,11 @@ validate-docbr
 ...
 ```
 
-Defina a variável de ambiente OPENAI_API_KEY com sua chave de API da OpenAI.
+Defina a variável de ambiente OPENAI_API_KEY com sua chave de API da OpenAI. (A segunda linha previne warnings do tokenizers)
 
 ```
 export OPENAI_API_KEY="sua_chave_aqui"  # Linux/Mac
+export TOKENIZERS_PARALLELISM=false
 ```
 
 Finalmente, rode
